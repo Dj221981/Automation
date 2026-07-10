@@ -1,0 +1,5 @@
+* linguist-vendored
+*.ts linguist-language=TypeScript
+*.tsx linguist-language=TypeScript
+*.js linguist-language=TypeScript
+*.json linguist-language=JSON
