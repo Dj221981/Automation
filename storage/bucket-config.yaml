@@ -1,0 +1,125 @@
+# Storage Bucket Configuration for Agentic Agents Memory
+# This configuration defines storage buckets for different agent types and memory layers
+
+buckets:
+  # Primary agent memory storage
+  agent_memory:
+    name: "ai-morphasis-agent-memory"
+    type: "primary"
+    description: "Core memory storage for all agentic agents"
+    retention_days: 365
+    versioning: true
+    encryption: true
+    replicas: 3
+    access_level: "private"
+    regions:
+      - "us-east-1"
+      - "eu-west-1"
+    tags:
+      environment: "production"
+      purpose: "agent-memory"
+      managed_by: "ai-morphasis"
+
+  # Short-term cache for active agents
+  agent_cache:
+    name: "ai-morphasis-agent-cache"
+    type: "cache"
+    description: "Temporary cache storage for active agent sessions"
+    retention_days: 30
+    versioning: false
+    encryption: true
+    replicas: 2
+    access_level: "private"
+    regions:
+      - "us-east-1"
+    tags:
+      environment: "production"
+      purpose: "agent-cache"
+      managed_by: "ai-morphasis"
+
+  # Archive storage for historical data
+  agent_archive:
+    name: "ai-morphasis-agent-archive"
+    type: "archive"
+    description: "Long-term archive storage for agent memory and history"
+    retention_days: 2555  # ~7 years
+    versioning: true
+    encryption: true
+    replicas: 2
+    access_level: "restricted"
+    storage_class: "glacier"
+    regions:
+      - "us-east-1"
+    tags:
+      environment: "production"
+      purpose: "agent-archive"
+      managed_by: "ai-morphasis"
+
+  # Backup storage for disaster recovery
+  agent_backups:
+    name: "ai-morphasis-agent-backups"
+    type: "backup"
+    description: "Backup storage for disaster recovery"
+    retention_days: 90
+    versioning: true
+    encryption: true
+    replicas: 3
+    cross_region_replication: true
+    access_level: "restricted"
+    regions:
+      - "us-east-1"
+      - "us-west-2"
+      - "eu-west-1"
+    tags:
+      environment: "production"
+      purpose: "agent-backup"
+      managed_by: "ai-morphasis"
+
+  # Agent-specific memory buckets
+  agent_specific:
+    - name: "ai-morphasis-reasoning-agent"
+      agent_type: "reasoning"
+      description: "Memory for reasoning and decision-making agents"
+      retention_days: 365
+      purpose: "Stores thought chains, inference logs, and decision history"
+      
+    - name: "ai-morphasis-learning-agent"
+      agent_type: "learning"
+      description: "Memory for learning and adaptation"
+      retention_days: 365
+      purpose: "Stores training data, model weights, and improvement logs"
+      
+    - name: "ai-morphasis-orchestration-agent"
+      agent_type: "orchestration"
+      description: "Memory for task orchestration and coordination"
+      retention_days: 180
+      purpose: "Stores task states, coordination logs, and workflow data"
+      
+    - name: "ai-morphasis-perception-agent"
+      agent_type: "perception"
+      description: "Memory for perception and analysis"
+      retention_days: 90
+      purpose: "Stores input processing, analysis results, and sensor data"
+
+# Access policies
+access_policies:
+  public_read: false
+  authenticated_only: true
+  encryption_required: true
+  mfa_required_for_deletion: true
+  audit_logging: true
+  object_lock: true  # Compliance mode for audit trails
+
+# Monitoring and alerts
+monitoring:
+  enabled: true
+  metrics:
+    - storage_usage
+    - access_patterns
+    - error_rates
+    - latency
+  alerts:
+    - high_storage_usage: "90%"
+    - access_anomaly: true
+    - failed_requests: ">100/hour"
+    - encryption_failures: true

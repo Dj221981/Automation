@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+# Deep thinking - simple Python script
+
+"""Prints a short message identifying this file.
+
+Originally this file contained the single line:
+    ai deepthinking
+
+This script preserves that text by printing it when run.
+"""
+
+
+def main():
+    print("ai deepthinking")
+
+
+if __name__ == "__main__":
+    main()
