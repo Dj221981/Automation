@@ -13,7 +13,7 @@ from src.agents.super_agentic_agents import (
 )
 
 
-def test_successful_task_updates_agent_and_system_bookkeeping():
+def test_task_success_updates_bookkeeping():
     """Successful execution should keep task lifecycle and metrics consistent."""
     system = AgentSystem("LifecycleSystem")
     executor = ExecutorAgent("LifecycleExecutor")
@@ -54,7 +54,7 @@ def test_successful_task_updates_agent_and_system_bookkeeping():
     assert task.metadata["status_history"][-1]["to"] == TaskStatus.COMPLETED.value
 
 
-def test_failed_task_resets_agent_status_and_updates_failure_metrics(monkeypatch):
+def test_task_failure_updates_metrics(monkeypatch):
     """Execution failures should not leave stale task or agent state behind."""
     system = AgentSystem("FailureSystem")
     executor = ExecutorAgent("FailureExecutor")
@@ -89,7 +89,7 @@ def test_failed_task_resets_agent_status_and_updates_failure_metrics(monkeypatch
     assert task.metadata["status_history"][-1]["to"] == TaskStatus.FAILED.value
 
 
-def test_dependency_validation_and_queue_ordering_are_deterministic():
+def test_dependency_validation_and_queue_ordering():
     """Dependencies should be validated and pending queue order should be stable."""
     system = AgentSystem("DependencySystem")
     executor = ExecutorAgent("DependencyExecutor")

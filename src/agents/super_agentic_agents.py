@@ -553,7 +553,7 @@ class OrchestratorAgent(BaseAgent):
             return None
 
         # Simple scoring: prefer less busy agents
-        return min(available_agents, key=lambda a: (len(a.active_tasks), a.last_activity, a.id))
+        return min(available_agents, key=lambda a: (len(a.active_tasks), a.last_activity, a.name))
 
     def get_system_status(self) -> Dict[str, Any]:
         """Get status of entire agent system."""
@@ -689,6 +689,7 @@ class AgentSystem:
         self.active_tasks: Dict[str, Task] = {}
         self.task_history: List[Task] = []
         self.task_registry: Dict[str, Task] = {}
+        self._task_sequence = 0
 
         self.system_metrics = {
             "total_agents": 1,
@@ -759,6 +760,7 @@ class AgentSystem:
             metadata=metadata or {}
         )
         self._validate_dependencies(task.dependencies)
+        self._assign_queue_order(task)
         self.task_registry[task.id] = task
         self._enqueue_task(task)
         self.system_metrics["total_tasks"] += 1
@@ -795,6 +797,12 @@ class AgentSystem:
             "failed_tasks": len(self.failed_tasks)
         }
 
+    def _assign_queue_order(self, task: Task) -> None:
+        """Attach a stable insertion order for deterministic queue sorting."""
+        if "queue_order" not in task.metadata:
+            task.metadata["queue_order"] = self._task_sequence
+            self._task_sequence += 1
+
     def _validate_dependencies(self, dependencies: List[str]) -> None:
         """Ensure dependencies reference known tasks."""
         unknown_dependencies = [
@@ -806,7 +814,13 @@ class AgentSystem:
 
     def _sort_queue(self, queue: List[Task]) -> None:
         """Sort a task queue deterministically by priority, creation time, and id."""
-        queue.sort(key=lambda item: (-item.priority.value, item.created_at, item.id))
+        queue.sort(
+            key=lambda item: (
+                -item.priority.value,
+                item.created_at,
+                item.metadata.get("queue_order", 0)
+            )
+        )
 
     def _enqueue_task(self, task: Task) -> None:
         """Add a task to system-managed queues if it is pending."""
@@ -838,6 +852,7 @@ class AgentSystem:
             except ValueError as exc:
                 logger.warning(f"Task {task.id} has invalid dependencies: {exc}")
                 return False
+            self._assign_queue_order(task)
             self.task_registry[task.id] = task
             self.system_metrics["total_tasks"] += 1
             self._enqueue_task(task)
