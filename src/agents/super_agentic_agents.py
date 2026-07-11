@@ -293,7 +293,7 @@ class BaseAgent(ABC):
         self.active_tasks: Dict[str, Task] = {}
         self.completed_tasks: List[Task] = []
         self.task_history: List[Task] = []
-        self.system: Optional["AgentSystem"] = None
+        self.system: Optional["AgentSystem"] = None  # Optional when used outside AgentSystem.
 
         self.parent_agent: Optional[str] = None
         self.child_agents: Set[str] = set()
@@ -345,6 +345,16 @@ class BaseAgent(ABC):
         """Get list of all capability names."""
         return list(self.capabilities.keys())
 
+    def _prepare_task_for_assignment(self, task: Task) -> bool:
+        """Validate task submission when the agent is attached to a system."""
+        return True if self.system is None else self.system._prepare_task_for_assignment(task)
+
+    def _notify_system(self, method_name: str, *args: Any, **kwargs: Any) -> None:
+        """Notify the attached system, if any, about an agent lifecycle event."""
+        if self.system is None:
+            return
+        getattr(self.system, method_name)(*args, **kwargs)
+
     def assign_task(self, task: Task) -> bool:
         """Assign a task to this agent."""
         if not isinstance(task, Task):
@@ -352,7 +362,7 @@ class BaseAgent(ABC):
         if self.status == AgentStatus.SUSPENDED:
             logger.warning(f"Cannot assign task {task.id} to suspended agent {self.name}")
             return False
-        if self.system and not self.system._prepare_task_for_assignment(task):
+        if not self._prepare_task_for_assignment(task):
             return False
         if task.id in self.active_tasks:
             logger.warning(f"Task {task.id} is already active on agent {self.name}")
@@ -374,8 +384,7 @@ class BaseAgent(ABC):
         self.last_activity = datetime.now()
         if self.status != AgentStatus.BUSY:
             self.status = AgentStatus.ACTIVE
-        if self.system:
-            self.system._on_task_assigned(self, task)
+        self._notify_system("_on_task_assigned", self, task)
         logger.info(f"Task {task.id} assigned to agent {self.name}")
         return True
 
@@ -402,8 +411,7 @@ class BaseAgent(ABC):
             task.result = None
             task.error = None
             task.transition_to(TaskStatus.RUNNING)
-            if self.system:
-                self.system._on_task_started(self, task)
+            self._notify_system("_on_task_started", self, task)
             logger.info(f"Agent {self.name} executing task {task.id}")
 
             # Think phase
@@ -462,8 +470,7 @@ class BaseAgent(ABC):
         self._update_metrics(task, success=success)
         self.last_activity = datetime.now()
         self._reset_status()
-        if self.system:
-            self.system._on_task_completed(self, task, success=success)
+        self._notify_system("_on_task_completed", self, task, success=success)
 
     def _reset_status(self) -> None:
         """Reset the agent to a coherent post-execution state."""
