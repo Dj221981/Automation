@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Simulation Training Platform</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ===== Header ===== -->
+<header>
+  <h1>🎯 Simulation Training Platform</h1>
+  <nav>
+    <button class="active" data-section="scenarios">Scenarios</button>
+    <button data-section="builder">Builder</button>
+    <button data-section="runner">Run Simulation</button>
+    <button data-section="results">Results</button>
+  </nav>
+</header>
+
+<main>
+
+  <!-- ===== Toast ===== -->
+  <div id="toast"></div>
+
+  <!-- ================================================================
+       SECTION: Scenarios list
+  ================================================================ -->
+  <section id="scenarios" class="active">
+    <div class="flex-row mt-2" style="margin-bottom:1rem">
+      <h2 style="font-size:1.3rem">Available Scenarios</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-primary" id="btn-new-scenario">+ New Scenario</button>
+    </div>
+    <div id="scenario-list">
+      <div class="empty-state"><div class="icon">📋</div><p>Loading scenarios…</p></div>
+    </div>
+  </section>
+
+  <!-- ================================================================
+       SECTION: Scenario builder / editor
+  ================================================================ -->
+  <section id="builder">
+    <div class="card">
+      <h2 id="builder-title">Create New Scenario</h2>
+      <hr class="divider" />
+
+      <form id="scenario-form">
+        <input type="hidden" id="edit-scenario-id" value="" />
+
+        <div class="form-group">
+          <label for="s-title">Title *</label>
+          <input id="s-title" type="text" placeholder="e.g. Fire Safety in the Workplace" required />
+        </div>
+
+        <div class="form-group">
+          <label for="s-desc">Description</label>
+          <textarea id="s-desc" rows="3" placeholder="Briefly describe the scenario…"></textarea>
+        </div>
+
+        <div class="flex-row">
+          <div class="form-group" style="flex:1">
+            <label for="s-difficulty">Difficulty</label>
+            <select id="s-difficulty">
+              <option value="easy">Easy</option>
+              <option value="medium" selected>Medium</option>
+              <option value="hard">Hard</option>
+            </select>
+          </div>
+          <div class="form-group" style="flex:2">
+            <label for="s-tags">Tags (comma-separated)</label>
+            <input id="s-tags" type="text" placeholder="e.g. safety, communication" />
+          </div>
+        </div>
+
+        <hr class="divider" />
+        <div class="flex-row" style="margin-bottom:.75rem">
+          <strong>Steps / Prompts</strong>
+          <span class="spacer"></span>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-add-step">+ Add Step</button>
+        </div>
+        <div id="steps-container"></div>
+
+        <div class="flex-row mt-2">
+          <button type="submit" class="btn btn-success" id="save-scenario-btn">Save Scenario</button>
+          <button type="button" class="btn btn-secondary" id="cancel-builder-btn">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <!-- ================================================================
+       SECTION: Simulation runner
+  ================================================================ -->
+  <section id="runner">
+    <!-- Step 0: pick scenario + enter name -->
+    <div id="runner-setup" class="card">
+      <h2>Start a Simulation</h2>
+      <hr class="divider" />
+      <div class="form-group">
+        <label for="run-scenario-select">Select Scenario</label>
+        <select id="run-scenario-select">
+          <option value="">— choose a scenario —</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="run-participant">Your Name (optional)</label>
+        <input id="run-participant" type="text" placeholder="Anonymous" />
+      </div>
+      <button class="btn btn-primary" id="btn-start-sim">Start Simulation</button>
+    </div>
+
+    <!-- Step N: answer prompts -->
+    <div id="runner-active" style="display:none">
+      <div class="card">
+        <div class="flex-row">
+          <h2 id="active-scenario-title"></h2>
+          <span class="spacer"></span>
+          <span id="active-participant-badge" class="badge badge-medium"></span>
+        </div>
+        <div id="sim-progress" class="mt-2"></div>
+        <hr class="divider" />
+
+        <div id="current-step-view">
+          <p class="text-muted" id="step-counter"></p>
+          <h3 id="step-prompt" style="margin:.75rem 0 1rem; font-size:1rem; line-height:1.5"></h3>
+          <div class="form-group">
+            <label for="step-response">Your Response</label>
+            <textarea id="step-response" rows="4" placeholder="Type your answer here…"></textarea>
+          </div>
+          <div class="flex-row">
+            <button class="btn btn-primary" id="btn-submit-response">Submit Response</button>
+            <button class="btn btn-secondary" id="btn-prev-step" disabled>← Previous</button>
+            <button class="btn btn-secondary" id="btn-next-step" disabled>Next →</button>
+            <span class="spacer"></span>
+            <button class="btn btn-success" id="btn-finish-sim">Finish &amp; Score</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Results view after completion -->
+    <div id="runner-results" style="display:none">
+      <div class="card">
+        <h2>Session Results</h2>
+        <hr class="divider" />
+        <div id="result-summary"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================
+       SECTION: Past results
+  ================================================================ -->
+  <section id="results">
+    <div class="flex-row mt-2" style="margin-bottom:1rem">
+      <h2 style="font-size:1.3rem">Past Session Results</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-secondary btn-sm" id="btn-refresh-results">↻ Refresh</button>
+    </div>
+    <div id="results-list">
+      <div class="empty-state"><div class="icon">📊</div><p>Loading results…</p></div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+/* ================================================================
+   Configuration
+================================================================ */
+const API = 'http://localhost:8000';
+
+/* ================================================================
+   Utilities
+================================================================ */
+function $(id) { return document.getElementById(id); }
+
+function toast(msg, error = false) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.className = 'show' + (error ? ' error-toast' : '');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = ''; }, 3500);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || 'API error');
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+function diffBadge(d) {
+  return `<span class="badge badge-${d}">${d}</span>`;
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+/* ================================================================
+   Navigation
+================================================================ */
+const sections = {};
+document.querySelectorAll('section').forEach(s => { sections[s.id] = s; });
+
+document.querySelectorAll('nav button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    Object.values(sections).forEach(s => s.classList.remove('active'));
+    const id = btn.dataset.section;
+    sections[id].classList.add('active');
+    if (id === 'scenarios') loadScenarios();
+    if (id === 'runner')    prepareRunner();
+    if (id === 'results')   loadResults();
+  });
+});
+
+function navigateTo(sectionId) {
+  document.querySelectorAll('nav button').forEach(b => {
+    b.classList.toggle('active', b.dataset.section === sectionId);
+  });
+  Object.values(sections).forEach(s => s.classList.remove('active'));
+  sections[sectionId].classList.add('active');
+  if (sectionId === 'scenarios') loadScenarios();
+  if (sectionId === 'runner')    prepareRunner();
+  if (sectionId === 'results')   loadResults();
+}
+
+/* ================================================================
+   SECTION: Scenarios List
+================================================================ */
+async function loadScenarios() {
+  const list = $('scenario-list');
+  list.innerHTML = '<div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div>';
+  try {
+    const scenarios = await api('/scenarios');
+    if (!scenarios.length) {
+      list.innerHTML = '<div class="empty-state"><div class="icon">📋</div><p>No scenarios yet. Click <b>+ New Scenario</b> to create one.</p></div>';
+      return;
+    }
+    list.innerHTML = scenarios.map(s => `
+      <div class="card">
+        <div class="flex-row">
+          <h2>${escHtml(s.title)}</h2>
+          <span class="spacer"></span>
+          ${diffBadge(s.difficulty)}
+        </div>
+        <p class="mt-1">${escHtml(s.description)}</p>
+        <div class="mt-1">
+          ${s.tags.map(t => `<span class="tag">${escHtml(t)}</span>`).join('')}
+        </div>
+        <p class="text-muted mt-1">${s.steps.length} step${s.steps.length !== 1 ? 's' : ''}</p>
+        <div class="flex-row mt-2">
+          <button class="btn btn-primary btn-sm" onclick="runScenario(${s.id})">▶ Run</button>
+          <button class="btn btn-secondary btn-sm" onclick="editScenario(${s.id})">✏ Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteScenario(${s.id}, '${escHtml(s.title).replace(/'/g, "\\'")}')">🗑 Delete</button>
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    list.innerHTML = `<div class="empty-state"><div class="icon">⚠️</div><p>${escHtml(e.message)}</p></div>`;
+  }
+}
+
+async function deleteScenario(id, title) {
+  if (!confirm(`Delete scenario "${title}"?`)) return;
+  try {
+    await api(`/scenarios/${id}`, { method: 'DELETE' });
+    toast('Scenario deleted');
+    loadScenarios();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$('btn-new-scenario').addEventListener('click', () => openBuilder(null));
+
+/* ================================================================
+   SECTION: Builder
+================================================================ */
+let editingScenarioId = null;
+
+function openBuilder(scenario) {
+  editingScenarioId = scenario ? scenario.id : null;
+  $('builder-title').textContent = scenario ? 'Edit Scenario' : 'Create New Scenario';
+  $('edit-scenario-id').value = scenario ? scenario.id : '';
+  $('s-title').value = scenario ? scenario.title : '';
+  $('s-desc').value = scenario ? scenario.description : '';
+  $('s-difficulty').value = scenario ? scenario.difficulty : 'medium';
+  $('s-tags').value = scenario ? scenario.tags.join(', ') : '';
+  renderStepEditor(scenario ? scenario.steps : []);
+  navigateTo('builder');
+}
+
+async function editScenario(id) {
+  try {
+    const s = await api(`/scenarios/${id}`);
+    openBuilder(s);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+// ---------- Step editor ----------
+
+let stepDrafts = [];  // array of step objects being edited
+
+function renderStepEditor(steps) {
+  stepDrafts = steps.map(s => ({ ...s }));
+  rebuildStepBoxes();
+}
+
+function rebuildStepBoxes() {
+  const container = $('steps-container');
+  if (!stepDrafts.length) {
+    container.innerHTML = '<p class="text-muted">No steps yet. Click <b>+ Add Step</b> to add one.</p>';
+    return;
+  }
+  container.innerHTML = stepDrafts.map((step, i) => `
+    <div class="step-box" data-idx="${i}">
+      <div class="step-header">
+        Step ${i + 1}
+        <button type="button" class="btn btn-danger btn-sm" onclick="removeStep(${i})">✕ Remove</button>
+      </div>
+      <div class="form-group">
+        <label>Prompt *</label>
+        <textarea rows="2" data-field="prompt" data-idx="${i}">${escHtml(step.prompt || '')}</textarea>
+      </div>
+      <div class="form-group">
+        <label>Expected Outcome *</label>
+        <textarea rows="2" data-field="expected_outcome" data-idx="${i}">${escHtml(step.expected_outcome || '')}</textarea>
+      </div>
+      <div class="flex-row">
+        <div class="form-group" style="flex:2">
+          <label>Keywords (comma-separated)</label>
+          <input type="text" data-field="keywords_str" data-idx="${i}" value="${escHtml((step.keywords || []).join(', '))}" />
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>Weight (0.1 – 5)</label>
+          <input type="number" step="0.1" min="0.1" max="5" data-field="weight" data-idx="${i}" value="${step.weight || 1.0}" />
+        </div>
+      </div>
+    </div>
+  `).join('');
+
+  // Attach live-update listeners
+  container.querySelectorAll('[data-field]').forEach(el => {
+    el.addEventListener('input', e => {
+      const idx = parseInt(e.target.dataset.idx);
+      const field = e.target.dataset.field;
+      if (field === 'keywords_str') {
+        stepDrafts[idx].keywords = e.target.value.split(',').map(k => k.trim()).filter(Boolean);
+      } else if (field === 'weight') {
+        stepDrafts[idx].weight = parseFloat(e.target.value) || 1.0;
+      } else {
+        stepDrafts[idx][field] = e.target.value;
+      }
+    });
+  });
+}
+
+function removeStep(idx) {
+  stepDrafts.splice(idx, 1);
+  rebuildStepBoxes();
+}
+
+$('btn-add-step').addEventListener('click', () => {
+  stepDrafts.push({ prompt: '', expected_outcome: '', keywords: [], weight: 1.0 });
+  rebuildStepBoxes();
+  $('steps-container').lastElementChild?.scrollIntoView({ behavior: 'smooth' });
+});
+
+$('cancel-builder-btn').addEventListener('click', () => navigateTo('scenarios'));
+
+$('scenario-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const payload = {
+    title: $('s-title').value.trim(),
+    description: $('s-desc').value.trim(),
+    difficulty: $('s-difficulty').value,
+    tags: $('s-tags').value.split(',').map(t => t.trim()).filter(Boolean),
+    steps: stepDrafts.map(s => ({
+      prompt: s.prompt,
+      expected_outcome: s.expected_outcome,
+      keywords: s.keywords || [],
+      weight: parseFloat(s.weight) || 1.0,
+    })).filter(s => s.prompt && s.expected_outcome),
+  };
+
+  if (!payload.title) { toast('Title is required', true); return; }
+
+  const btn = $('save-scenario-btn');
+  btn.disabled = true;
+  try {
+    if (editingScenarioId) {
+      await api(`/scenarios/${editingScenarioId}`, { method: 'PUT', body: JSON.stringify(payload) });
+      toast('Scenario updated!');
+    } else {
+      await api('/scenarios', { method: 'POST', body: JSON.stringify(payload) });
+      toast('Scenario created!');
+    }
+    navigateTo('scenarios');
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* ================================================================
+   SECTION: Simulation Runner
+================================================================ */
+let simState = {
+  session: null,
+  scenario: null,
+  currentStep: 0,
+  responses: {},  // stepIndex -> text
+};
+
+async function prepareRunner() {
+  // Reload scenario dropdown
+  const sel = $('run-scenario-select');
+  sel.innerHTML = '<option value="">— choose a scenario —</option>';
+  try {
+    const scenarios = await api('/scenarios');
+    scenarios.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.id;
+      opt.textContent = `${s.title} (${s.difficulty})`;
+      sel.appendChild(opt);
+    });
+  } catch (e) { /* silently ignore */ }
+
+  $('runner-setup').style.display = '';
+  $('runner-active').style.display = 'none';
+  $('runner-results').style.display = 'none';
+}
+
+// Pre-fill scenario if coming from Scenarios list
+function runScenario(scenarioId) {
+  navigateTo('runner');
+  setTimeout(() => {
+    $('run-scenario-select').value = scenarioId;
+  }, 50);
+}
+
+$('btn-start-sim').addEventListener('click', async () => {
+  const scenarioId = $('run-scenario-select').value;
+  if (!scenarioId) { toast('Please select a scenario', true); return; }
+  const participant = $('run-participant').value.trim() || 'Anonymous';
+
+  try {
+    const [scenario, session] = await Promise.all([
+      api(`/scenarios/${scenarioId}`),
+      api(`/scenarios/${scenarioId}/sessions`, {
+        method: 'POST',
+        body: JSON.stringify({ participant_name: participant }),
+      }),
+    ]);
+
+    simState = { session, scenario, currentStep: 0, responses: {} };
+    startActiveView();
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+
+function startActiveView() {
+  $('runner-setup').style.display = 'none';
+  $('runner-active').style.display = '';
+  $('runner-results').style.display = 'none';
+
+  $('active-scenario-title').textContent = simState.scenario.title;
+  $('active-participant-badge').textContent = simState.session.participant_name;
+
+  renderProgressDots();
+  showStep(0);
+}
+
+function renderProgressDots() {
+  const progress = $('sim-progress');
+  const steps = simState.scenario.steps;
+  progress.innerHTML = steps.map((_, i) => `
+    <div class="step-dot ${i === simState.currentStep ? 'active' : ''} ${simState.responses[i] ? 'answered' : ''}"
+         onclick="showStep(${i})">${i + 1}</div>
+  `).join('');
+}
+
+function showStep(idx) {
+  const steps = simState.scenario.steps;
+  if (idx < 0 || idx >= steps.length) return;
+  simState.currentStep = idx;
+  const step = steps[idx];
+
+  $('step-counter').textContent = `Step ${idx + 1} of ${steps.length}`;
+  $('step-prompt').textContent = step.prompt;
+  $('step-response').value = simState.responses[idx] || '';
+  $('btn-prev-step').disabled = idx === 0;
+  $('btn-next-step').disabled = idx === steps.length - 1;
+
+  renderProgressDots();
+}
+
+$('btn-prev-step').addEventListener('click', () => showStep(simState.currentStep - 1));
+$('btn-next-step').addEventListener('click', () => showStep(simState.currentStep + 1));
+
+$('btn-submit-response').addEventListener('click', async () => {
+  const response = $('step-response').value.trim();
+  if (!response) { toast('Please type a response before submitting', true); return; }
+
+  const btn = $('btn-submit-response');
+  btn.disabled = true;
+  try {
+    await api(`/sessions/${simState.session.id}/responses`, {
+      method: 'POST',
+      body: JSON.stringify({ step_index: simState.currentStep, response }),
+    });
+    simState.responses[simState.currentStep] = response;
+    toast('Response saved ✓');
+    // Auto-advance to next unanswered step
+    const steps = simState.scenario.steps;
+    const next = steps.findIndex((_, i) => i > simState.currentStep && !simState.responses[i]);
+    if (next !== -1) showStep(next);
+    else renderProgressDots();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('btn-finish-sim').addEventListener('click', async () => {
+  if (!confirm('Finish and score your simulation?')) return;
+  const btn = $('btn-finish-sim');
+  btn.disabled = true;
+  try {
+    const result = await api(`/sessions/${simState.session.id}/complete`, { method: 'POST' });
+    showSessionResult(result);
+  } catch (e) {
+    toast(e.message, true);
+    btn.disabled = false;
+  }
+});
+
+function showSessionResult(session) {
+  $('runner-active').style.display = 'none';
+  $('runner-results').style.display = '';
+
+  const pct = session.score ?? 0;
+  const steps = simState.scenario.steps;
+  const responses = session.responses || [];
+
+  const perStepHtml = responses.map(r => {
+    const step = steps[r.step_index] || {};
+    const score = r.step_score ?? null;
+    const maxScore = r.max_score ?? 1;
+    const cls = score === null ? '' : score / maxScore >= 0.7 ? 'good' : score / maxScore >= 0.4 ? 'medium' : 'poor';
+    const pctStep = score === null ? '—' : Math.round((score / maxScore) * 100) + '%';
+    return `
+      <div class="per-step-result ${cls}">
+        <strong>Step ${r.step_index + 1}:</strong> ${escHtml(step.prompt || '')}
+        <br/><span class="text-muted">Your answer:</span> ${escHtml(r.response)}
+        <br/><span class="text-muted">Score: ${pctStep}</span>
+      </div>
+    `;
+  }).join('');
+
+  $('result-summary').innerHTML = `
+    <div class="flex-row">
+      <div>
+        <h3 style="font-size:2.5rem; color:#0f3460">${pct.toFixed(1)}%</h3>
+        <p class="text-muted">Overall Score</p>
+      </div>
+      <div style="flex:1; margin-left:1.5rem">
+        <div class="score-bar-wrap">
+          <div class="score-bar" style="width:${pct}%">${pct.toFixed(0)}%</div>
+        </div>
+        <p style="font-size:.95rem; line-height:1.6">${escHtml(session.feedback)}</p>
+      </div>
+    </div>
+    <hr class="divider" />
+    <h4 style="margin-bottom:.75rem">Per-step Breakdown</h4>
+    ${perStepHtml}
+    <div class="flex-row mt-2">
+      <button class="btn btn-primary" onclick="prepareRunner(); navigateTo('runner')">Run Again</button>
+      <button class="btn btn-secondary" onclick="navigateTo('results')">View All Results</button>
+    </div>
+  `;
+}
+
+/* ================================================================
+   SECTION: Past Results
+================================================================ */
+async function loadResults() {
+  const list = $('results-list');
+  list.innerHTML = '<div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div>';
+  try {
+    const [sessions, scenarios] = await Promise.all([
+      api('/sessions'),
+      api('/scenarios'),
+    ]);
+    const scenarioMap = Object.fromEntries(scenarios.map(s => [s.id, s]));
+
+    if (!sessions.length) {
+      list.innerHTML = '<div class="empty-state"><div class="icon">📊</div><p>No sessions yet. Run a simulation to see results here.</p></div>';
+      return;
+    }
+
+    const sorted = [...sessions].sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
+
+    list.innerHTML = sorted.map(sess => {
+      const scenario = scenarioMap[sess.scenario_id] || {};
+      const started = new Date(sess.started_at).toLocaleString();
+      const pct = sess.score !== null ? sess.score.toFixed(1) + '%' : '—';
+      const statusColor = sess.status === 'completed' ? '#198754' : '#ffc107';
+      return `
+        <div class="card">
+          <div class="flex-row">
+            <div>
+              <h2>${escHtml(scenario.title || 'Unknown Scenario')}</h2>
+              <p class="text-muted">${escHtml(sess.participant_name)} · ${started}</p>
+            </div>
+            <span class="spacer"></span>
+            <div style="text-align:right">
+              <div style="font-size:1.6rem; font-weight:700; color:#0f3460">${pct}</div>
+              <span style="font-size:.8rem; color:${statusColor}; font-weight:600">${sess.status.toUpperCase()}</span>
+            </div>
+          </div>
+          ${sess.feedback ? `<p class="mt-1" style="font-size:.9rem; color:#555">${escHtml(sess.feedback)}</p>` : ''}
+          <p class="text-muted mt-1">${sess.responses.length} response${sess.responses.length !== 1 ? 's' : ''} recorded</p>
+        </div>
+      `;
+    }).join('');
+  } catch (e) {
+    list.innerHTML = `<div class="empty-state"><div class="icon">⚠️</div><p>${escHtml(e.message)}</p></div>`;
+  }
+}
+
+$('btn-refresh-results').addEventListener('click', loadResults);
+
+/* ================================================================
+   Init
+================================================================ */
+loadScenarios();
+</script>
+</body>
+</html>
