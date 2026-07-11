@@ -247,9 +247,9 @@ class TestAsyncExecution:
 # Retry logic
 # ============================================================================
 
-class _FlakeyExecutorAgent(ExecutorAgent):
+class _FlakyExecutorAgent(ExecutorAgent):
     """An executor whose act() fails the first two times, then succeeds."""
-    def __init__(self, name: str = "Flakey"):
+    def __init__(self, name: str = "Flaky"):
         super().__init__(name, max_retries=3, retry_delay=0.01)
         self._call_count = 0
 
@@ -263,7 +263,7 @@ class _FlakeyExecutorAgent(ExecutorAgent):
 @pytest.mark.asyncio
 class TestRetryLogic:
     async def test_retries_then_succeeds(self):
-        agent = _FlakeyExecutorAgent()
+        agent = _FlakyExecutorAgent()
         task = make_task("Retry task")
         agent.assign_task(task)
         result = await agent.execute_task(task)

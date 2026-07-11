@@ -246,9 +246,13 @@ class AgentMemory:
             return local
         redis = await self._get_redis()
         if redis:
-            for kind in (["episodic", "semantic"] if memory_type == "auto" else [memory_type]):
-                rkey = (self._episodic_redis_key(key) if kind == "episodic"
-                        else self._semantic_redis_key(key))
+            memory_types = ["episodic", "semantic"] if memory_type == "auto" else [memory_type]
+            redis_key_fn = {
+                "episodic": self._episodic_redis_key,
+                "semantic": self._semantic_redis_key,
+            }
+            for kind in memory_types:
+                rkey = redis_key_fn[kind](key)
                 try:
                     raw = await redis.get(rkey)
                     if raw:

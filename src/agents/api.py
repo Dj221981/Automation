@@ -15,7 +15,7 @@ Endpoints:
     POST /tasks   – Create and submit a new task
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel as PydanticBaseModel, Field
@@ -47,7 +47,7 @@ class TaskRequest(PydanticBaseModel):
     description: str = Field(..., min_length=1)
     priority: str = Field(default="NORMAL")
     parameters: Dict[str, Any] = Field(default_factory=dict)
-    dependencies: list = Field(default_factory=list)
+    dependencies: List[str] = Field(default_factory=list)
     agent_id: Optional[str] = Field(default=None, description="Target agent ID (optional)")
 
 
