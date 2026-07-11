@@ -66,10 +66,10 @@ def test_task_failure_updates_metrics(monkeypatch):
     )
     assert system.submit_task(task, executor.id) is True
 
-    def fail_task(_decision):
+    def mock_act_failure(_decision):
         raise RuntimeError("simulated failure")
 
-    monkeypatch.setattr(executor, "act", fail_task)
+    monkeypatch.setattr(executor, "act", mock_act_failure)
 
     with pytest.raises(RuntimeError, match="simulated failure"):
         executor.execute_task(task)

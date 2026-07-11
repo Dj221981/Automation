@@ -323,7 +323,7 @@ class BaseAgent(ABC):
         """Register a new capability."""
         if not isinstance(capability, AgentCapability):
             raise TypeError("capability must be an AgentCapability instance")
-        if not capability.name or not capability.name.strip():
+        if not isinstance(capability.name, str) or not capability.name.strip():
             raise ValueError("Capability name must be a non-empty string")
         if not 0.0 <= capability.confidence_score <= 1.0:
             raise ValueError("Capability confidence_score must be between 0.0 and 1.0 inclusive")
@@ -563,7 +563,7 @@ class OrchestratorAgent(BaseAgent):
         """Select best agent for task based on capabilities."""
         available_agents = [
             a for a in self.managed_agents.values()
-            if a.status not in {AgentStatus.SUSPENDED}
+            if a.status != AgentStatus.SUSPENDED
         ]
 
         if not available_agents:
