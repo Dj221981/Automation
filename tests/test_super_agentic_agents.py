@@ -159,7 +159,7 @@ def test_remove_agent_rejects_active_tasks_and_succeeds_after_completion():
 
 def test_invalid_inputs_are_rejected_early():
     """Invalid task and agent input should fail fast."""
-    with pytest.raises(ValueError, match="non-empty string"):
+    with pytest.raises(ValueError, match="empty or whitespace-only"):
         ExecutorAgent(" ")
 
     with pytest.raises(TypeError, match="dictionary"):

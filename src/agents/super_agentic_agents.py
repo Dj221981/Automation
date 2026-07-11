@@ -270,8 +270,10 @@ class BaseAgent(ABC):
         max_capabilities: int = 50
     ):
         """Initialize a base agent."""
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("Agent name must be a non-empty string")
+        if not isinstance(name, str):
+            raise TypeError("Agent name must be a string")
+        if not name.strip():
+            raise ValueError("Agent name cannot be empty or whitespace-only")
         if not isinstance(role, AgentRole):
             raise TypeError("Agent role must be an AgentRole value")
         if not isinstance(max_capabilities, int) or max_capabilities <= 0:
@@ -324,7 +326,7 @@ class BaseAgent(ABC):
         if not capability.name or not capability.name.strip():
             raise ValueError("Capability name must be a non-empty string")
         if not 0.0 <= capability.confidence_score <= 1.0:
-            raise ValueError("Capability confidence_score must be between 0.0 and 1.0")
+            raise ValueError("Capability confidence_score must be between 0.0 and 1.0 inclusive")
         if len(self.capabilities) >= self.max_capabilities:
             logger.warning(f"Agent {self.name} has reached max capabilities limit")
             return False
@@ -423,7 +425,7 @@ class BaseAgent(ABC):
             task.error = str(e)
             task.completed_at = datetime.now()
             self.status = AgentStatus.ERROR
-            logger.exception(f"Task {task.id} failed on agent {self.name}: {str(e)}")
+            logger.exception(f"Task {task.id} failed on agent {self.name}")
             raise
         finally:
             if not task.completed_at:
@@ -561,7 +563,7 @@ class OrchestratorAgent(BaseAgent):
             return None
 
         # Prefer agents with fewer active tasks, then the least recently active agent
-        # to balance work while keeping the selection deterministic.
+        # (older last_activity timestamp) to balance work while keeping the selection deterministic.
         return min(available_agents, key=lambda a: (len(a.active_tasks), a.last_activity, a.name))
 
     def get_system_status(self) -> Dict[str, Any]:
@@ -683,8 +685,10 @@ class AgentSystem:
     """
 
     def __init__(self, name: str = "Ai-morphasis"):
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("System name must be a non-empty string")
+        if not isinstance(name, str):
+            raise TypeError("System name must be a string")
+        if not name.strip():
+            raise ValueError("System name cannot be empty or whitespace-only")
         self.name = name.strip()
         self.id = str(uuid.uuid4())
         self.created_at = datetime.now()
@@ -966,10 +970,14 @@ class AgentFactory:
     @classmethod
     def create_agent(cls, agent_type: str, name: str) -> Optional[BaseAgent]:
         """Create an agent from template."""
-        if not isinstance(agent_type, str) or not agent_type.strip():
-            raise ValueError("agent_type must be a non-empty string")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("name must be a non-empty string")
+        if not isinstance(agent_type, str):
+            raise TypeError("agent_type must be a string")
+        if not agent_type.strip():
+            raise ValueError("agent_type cannot be empty or whitespace-only")
+        if not isinstance(name, str):
+            raise TypeError("name must be a string")
+        if not name.strip():
+            raise ValueError("name cannot be empty or whitespace-only")
         agent_class = cls._agent_templates.get(agent_type.strip().lower())
         if agent_class:
             return agent_class(name)
