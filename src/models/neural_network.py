@@ -1,18 +1,32 @@
 """
-Neural Network Model for AI-morphasis Agent Learning System
+Production-ready Deep Q-Network (DQN) model for agent learning.
 
-This module implements deep learning models using TensorFlow/Keras for training
-adaptive agents with reinforcement learning capabilities.
+This module provides a hardened DQN implementation built with TensorFlow/Keras.
+It includes:
+- explicit model initialization/build steps for subclassed Keras models
+- strict configuration and batch validation
+- stable target network synchronization
+- gradient clipping and finite-loss checks
+- robust summary, save, and load helpers
+- validated experience replay buffer behavior
+
+The previous mixed DQN/policy-gradient implementation has been narrowed to DQN
+only so the module can be operated safely in production.
 """
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers, Model, Sequential
+from tensorflow.keras import Model, layers
+from tensorflow.keras.losses import Huber
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.losses import MeanSquaredError, Huber
-from typing import Tuple, Optional, Dict, Any, List
-import logging
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -21,165 +35,80 @@ logger = logging.getLogger(__name__)
 class DQNNetwork(Model):
     """
     Deep Q-Network (DQN) for agent decision-making and learning.
-    
-    This network learns to estimate action values (Q-values) for reinforcement learning.
-    Used for agent action selection and policy optimization.
+
+    This network estimates action values (Q-values) for reinforcement learning.
     """
 
     def __init__(
         self,
         state_size: int,
         action_size: int,
-        hidden_layers: List[int] = None,
+        hidden_layers: Optional[List[int]] = None,
         activation: str = "relu",
-        name: str = "dqn_network"
+        dropout_rate: float = 0.0,
+        use_batch_norm: bool = False,
+        name: str = "dqn_network",
     ):
-        """
-        Initialize DQN Network.
+        super().__init__(name=name)
 
-        Args:
-            state_size: Dimension of state space
-            action_size: Number of possible actions
-            hidden_layers: List of hidden layer sizes (default: [128, 64])
-            activation: Activation function for hidden layers
-            name: Model name
-        """
-        super(DQNNetwork, self).__init__(name=name)
-        
+        if state_size <= 0:
+            raise ValueError("state_size must be a positive integer")
+        if action_size <= 0:
+            raise ValueError("action_size must be a positive integer")
         if hidden_layers is None:
             hidden_layers = [128, 64]
-        
+        if not hidden_layers:
+            raise ValueError("hidden_layers must contain at least one layer size")
+        if any(units <= 0 for units in hidden_layers):
+            raise ValueError("all hidden layer sizes must be positive")
+        if not 0.0 <= dropout_rate < 1.0:
+            raise ValueError("dropout_rate must be in the range [0.0, 1.0)")
+
         self.state_size = state_size
         self.action_size = action_size
         self.activation = activation
-        
-        # Build network layers
-        self.dense_layers = []
+        self.dropout_rate = dropout_rate
+        self.use_batch_norm = use_batch_norm
+        self.hidden_layers = list(hidden_layers)
+
+        self.hidden_stack: List[layers.Layer] = []
         for units in hidden_layers:
-            self.dense_layers.append(layers.Dense(units, activation=activation))
-            self.dense_layers.append(layers.BatchNormalization())
-            self.dense_layers.append(layers.Dropout(0.2))
-        
-        # Output Q-value layer
+            self.hidden_stack.append(layers.Dense(units, activation=activation))
+            if use_batch_norm:
+                self.hidden_stack.append(layers.BatchNormalization())
+            if dropout_rate > 0.0:
+                self.hidden_stack.append(layers.Dropout(dropout_rate))
+
         self.output_layer = layers.Dense(action_size, activation=None)
-        
+
         logger.info(
-            f"DQN Network initialized: state_size={state_size}, "
-            f"action_size={action_size}, hidden_layers={hidden_layers}"
+            "DQNNetwork initialized: state_size=%s action_size=%s hidden_layers=%s",
+            state_size,
+            action_size,
+            hidden_layers,
         )
 
     def call(self, states: tf.Tensor, training: bool = False) -> tf.Tensor:
-        """
-        Forward pass through the network.
-
-        Args:
-            states: Input state tensor [batch_size, state_size]
-            training: Whether in training mode (for dropout/batchnorm)
-
-        Returns:
-            Q-values [batch_size, action_size]
-        """
+        """Run a forward pass and return Q-values."""
         x = states
-        for layer in self.dense_layers:
-            if isinstance(layer, layers.Dropout):
-                x = layer(x, training=training)
-            elif isinstance(layer, layers.BatchNormalization):
+        for layer in self.hidden_stack:
+            if isinstance(layer, (layers.Dropout, layers.BatchNormalization)):
                 x = layer(x, training=training)
             else:
                 x = layer(x)
-        
         return self.output_layer(x)
-
-
-class PolicyNetwork(Model):
-    """
-    Policy Network for Actor-Critic learning.
-    
-    Learns the agent's policy (probability distribution over actions)
-    for continuous and discrete action spaces.
-    """
-
-    def __init__(
-        self,
-        state_size: int,
-        action_size: int,
-        hidden_layers: List[int] = None,
-        action_space: str = "discrete",
-        name: str = "policy_network"
-    ):
-        """
-        Initialize Policy Network.
-
-        Args:
-            state_size: Dimension of state space
-            action_size: Number of actions or action dimension
-            hidden_layers: List of hidden layer sizes
-            action_space: "discrete" or "continuous"
-            name: Model name
-        """
-        super(PolicyNetwork, self).__init__(name=name)
-        
-        if hidden_layers is None:
-            hidden_layers = [128, 64]
-        
-        self.state_size = state_size
-        self.action_size = action_size
-        self.action_space = action_space
-        
-        # Shared layers
-        self.shared_layers = Sequential([
-            layers.Dense(units, activation="relu")
-            for units in hidden_layers
-        ])
-        
-        # Policy head (output probabilities)
-        if action_space == "discrete":
-            self.policy_head = layers.Dense(action_size, activation="softmax")
-        else:
-            # Continuous: mean and log-std
-            self.mean = layers.Dense(action_size, activation="tanh")
-            self.log_std = layers.Dense(action_size, activation=None)
-        
-        # Value head (for critic)
-        self.value_head = layers.Dense(1, activation=None)
-        
-        logger.info(
-            f"Policy Network initialized: state_size={state_size}, "
-            f"action_size={action_size}, action_space={action_space}"
-        )
-
-    def call(self, states: tf.Tensor, training: bool = False) -> Tuple[tf.Tensor, tf.Tensor]:
-        """
-        Forward pass returning policy and value estimates.
-
-        Args:
-            states: Input state tensor
-            training: Whether in training mode
-
-        Returns:
-            Tuple of (policy_output, value_estimate)
-        """
-        shared = self.shared_layers(states, training=training)
-        
-        if self.action_space == "discrete":
-            policy = self.policy_head(shared)
-        else:
-            mean = self.mean(shared)
-            log_std = self.log_std(shared)
-            policy = tf.concat([mean, log_std], axis=-1)
-        
-        value = self.value_head(shared)
-        
-        return policy, value
 
 
 class AgentLearningModel:
     """
-    Comprehensive learning model for AI-morphasis agents.
-    
-    Integrates DQN and Policy networks with training loops,
-    experience replay, and learning optimization.
+    Production-hardened DQN learning model.
+
+    This class intentionally supports only DQN so behavior is explicit and safe
+    for production usage.
     """
+
+    SUPPORTED_MODEL_TYPES = {"dqn"}
+    SUPPORTED_DEVICES = {"cpu", "gpu"}
 
     def __init__(
         self,
@@ -191,22 +120,26 @@ class AgentLearningModel:
         epsilon_decay: float = 0.995,
         epsilon_min: float = 0.01,
         model_type: str = "dqn",
-        device: str = "cpu"
+        device: str = "cpu",
+        hidden_layers: Optional[List[int]] = None,
+        dropout_rate: float = 0.0,
+        use_batch_norm: bool = False,
+        gradient_clip_norm: float = 10.0,
+        seed: Optional[int] = None,
     ):
-        """
-        Initialize Agent Learning Model.
+        self._validate_configuration(
+            state_size=state_size,
+            action_size=action_size,
+            learning_rate=learning_rate,
+            gamma=gamma,
+            epsilon=epsilon,
+            epsilon_decay=epsilon_decay,
+            epsilon_min=epsilon_min,
+            model_type=model_type,
+            device=device,
+            gradient_clip_norm=gradient_clip_norm,
+        )
 
-        Args:
-            state_size: Dimension of state space
-            action_size: Number of actions
-            learning_rate: Learning rate for optimizer
-            gamma: Discount factor for future rewards
-            epsilon: Initial exploration rate (for epsilon-greedy)
-            epsilon_decay: Decay rate for epsilon
-            epsilon_min: Minimum epsilon value
-            model_type: "dqn" or "policy_gradient"
-            device: "cpu" or "gpu"
-        """
         self.state_size = state_size
         self.action_size = action_size
         self.learning_rate = learning_rate
@@ -216,59 +149,181 @@ class AgentLearningModel:
         self.epsilon_min = epsilon_min
         self.model_type = model_type
         self.device = device
-        
-        # Set device
-        if device == "gpu" and tf.config.list_physical_devices("GPU"):
-            self.device_name = "/GPU:0"
-            logger.info("Using GPU for training")
-        else:
-            self.device_name = "/CPU:0"
-            logger.info("Using CPU for training")
-        
-        # Initialize networks
-        if model_type == "dqn":
-            self.network = DQNNetwork(state_size, action_size)
-            self.target_network = DQNNetwork(state_size, action_size)
-            self.target_network.set_weights(self.network.get_weights())
-        else:
-            self.network = PolicyNetwork(state_size, action_size)
-        
-        # Optimizer and loss
-        self.optimizer = Adam(learning_rate=learning_rate)
-        if model_type == "dqn":
-            self.loss_fn = Huber()
-        else:
-            self.loss_fn = MeanSquaredError()
-        
-        # Metrics
-        self.train_loss = keras.metrics.Mean(name="train_loss")
-        
-        logger.info(
-            f"Agent Learning Model initialized: "
-            f"model_type={model_type}, learning_rate={learning_rate}"
+        self.hidden_layers = hidden_layers or [128, 64]
+        self.dropout_rate = dropout_rate
+        self.use_batch_norm = use_batch_norm
+        self.gradient_clip_norm = gradient_clip_norm
+        self.seed = seed
+
+        if seed is not None:
+            np.random.seed(seed)
+            tf.random.set_seed(seed)
+
+        self.device_name = self._resolve_device_name(device)
+
+        self.network = DQNNetwork(
+            state_size=state_size,
+            action_size=action_size,
+            hidden_layers=self.hidden_layers,
+            dropout_rate=dropout_rate,
+            use_batch_norm=use_batch_norm,
+            name="online_dqn_network",
+        )
+        self.target_network = DQNNetwork(
+            state_size=state_size,
+            action_size=action_size,
+            hidden_layers=self.hidden_layers,
+            dropout_rate=dropout_rate,
+            use_batch_norm=use_batch_norm,
+            name="target_dqn_network",
         )
 
-    def select_action(
+        self._build_networks()
+        self.update_target_network()
+
+        self.optimizer = Adam(learning_rate=learning_rate, clipnorm=gradient_clip_norm)
+        self.loss_fn = Huber()
+        self.train_loss = keras.metrics.Mean(name="train_loss")
+
+        logger.info(
+            "AgentLearningModel initialized: model_type=%s learning_rate=%s device=%s",
+            model_type,
+            learning_rate,
+            self.device_name,
+        )
+
+    @classmethod
+    def _validate_configuration(
+        cls,
+        *,
+        state_size: int,
+        action_size: int,
+        learning_rate: float,
+        gamma: float,
+        epsilon: float,
+        epsilon_decay: float,
+        epsilon_min: float,
+        model_type: str,
+        device: str,
+        gradient_clip_norm: float,
+    ) -> None:
+        if state_size <= 0:
+            raise ValueError("state_size must be a positive integer")
+        if action_size <= 0:
+            raise ValueError("action_size must be a positive integer")
+        if learning_rate <= 0:
+            raise ValueError("learning_rate must be greater than 0")
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError("gamma must be in the range [0.0, 1.0]")
+        if not 0.0 <= epsilon <= 1.0:
+            raise ValueError("epsilon must be in the range [0.0, 1.0]")
+        if not 0.0 < epsilon_decay <= 1.0:
+            raise ValueError("epsilon_decay must be in the range (0.0, 1.0]")
+        if not 0.0 <= epsilon_min <= 1.0:
+            raise ValueError("epsilon_min must be in the range [0.0, 1.0]")
+        if epsilon_min > epsilon:
+            raise ValueError("epsilon_min cannot be greater than epsilon")
+        if model_type not in cls.SUPPORTED_MODEL_TYPES:
+            raise ValueError(
+                f"Unsupported model_type '{model_type}'. Supported values: {sorted(cls.SUPPORTED_MODEL_TYPES)}"
+            )
+        if device not in cls.SUPPORTED_DEVICES:
+            raise ValueError(
+                f"Unsupported device '{device}'. Supported values: {sorted(cls.SUPPORTED_DEVICES)}"
+            )
+        if gradient_clip_norm <= 0:
+            raise ValueError("gradient_clip_norm must be greater than 0")
+
+    def _resolve_device_name(self, device: str) -> str:
+        if device == "gpu":
+            gpus = tf.config.list_physical_devices("GPU")
+            if gpus:
+                logger.info("Using GPU for training")
+                return "/GPU:0"
+            logger.warning("GPU requested but no GPU was detected. Falling back to CPU.")
+        logger.info("Using CPU for training")
+        return "/CPU:0"
+
+    def _build_networks(self) -> None:
+        dummy_input = tf.zeros((1, self.state_size), dtype=tf.float32)
+        self.network(dummy_input, training=False)
+        self.target_network(dummy_input, training=False)
+
+    def _validate_state_vector(self, state: np.ndarray) -> np.ndarray:
+        state_array = np.asarray(state, dtype=np.float32)
+        if state_array.shape != (self.state_size,):
+            raise ValueError(
+                f"state must have shape ({self.state_size},), received {state_array.shape}"
+            )
+        if not np.all(np.isfinite(state_array)):
+            raise ValueError("state contains NaN or infinite values")
+        return state_array
+
+    def _validate_training_batch(
         self,
-        state: np.ndarray,
-        training: bool = True
-    ) -> int:
-        """
-        Select action using epsilon-greedy strategy (for DQN).
+        states: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        next_states: np.ndarray,
+        dones: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        states = np.asarray(states, dtype=np.float32)
+        next_states = np.asarray(next_states, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.int32)
+        rewards = np.asarray(rewards, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32)
 
-        Args:
-            state: Current state
-            training: Whether in training mode
+        if states.ndim != 2 or states.shape[1] != self.state_size:
+            raise ValueError(
+                f"states must have shape [batch_size, {self.state_size}], received {states.shape}"
+            )
+        if next_states.ndim != 2 or next_states.shape[1] != self.state_size:
+            raise ValueError(
+                f"next_states must have shape [batch_size, {self.state_size}], received {next_states.shape}"
+            )
+        batch_size = states.shape[0]
+        expected_shapes = {
+            "actions": actions.shape,
+            "rewards": rewards.shape,
+            "dones": dones.shape,
+            "next_states": next_states.shape,
+        }
+        if batch_size == 0:
+            raise ValueError("training batch must contain at least one sample")
+        if actions.shape != (batch_size,):
+            raise ValueError(f"actions must have shape ({batch_size},), received {actions.shape}")
+        if rewards.shape != (batch_size,):
+            raise ValueError(f"rewards must have shape ({batch_size},), received {rewards.shape}")
+        if dones.shape != (batch_size,):
+            raise ValueError(f"dones must have shape ({batch_size},), received {dones.shape}")
+        if next_states.shape[0] != batch_size:
+            raise ValueError(
+                "next_states batch size must match states batch size; "
+                f"received states={states.shape}, next_states={next_states.shape}"
+            )
+        if np.any(actions < 0) or np.any(actions >= self.action_size):
+            raise ValueError("actions contain values outside the valid action range")
+        for name, array in {
+            "states": states,
+            "next_states": next_states,
+            "rewards": rewards,
+            "dones": dones,
+        }.items():
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"{name} contains NaN or infinite values")
+        return states, actions, rewards, next_states, dones
 
-        Returns:
-            Selected action index
-        """
+    def select_action(self, state: np.ndarray, training: bool = True) -> int:
+        """Select an action using epsilon-greedy exploration."""
+        state_array = self._validate_state_vector(state)
+
         if training and np.random.random() < self.epsilon:
-            return np.random.randint(0, self.action_size)
-        
-        state_tensor = tf.convert_to_tensor([state], dtype=tf.float32)
+            return int(np.random.randint(0, self.action_size))
+
+        state_tensor = tf.convert_to_tensor(state_array[None, :], dtype=tf.float32)
         q_values = self.network(state_tensor, training=False)
-        return np.argmax(q_values.numpy()[0])
+        action = int(tf.argmax(q_values[0]).numpy())
+        return action
 
     def train_step(
         self,
@@ -276,110 +331,121 @@ class AgentLearningModel:
         actions: np.ndarray,
         rewards: np.ndarray,
         next_states: np.ndarray,
-        dones: np.ndarray
+        dones: np.ndarray,
     ) -> float:
-        """
-        Perform one training step on a batch of experiences.
+        """Perform one validated DQN training step on a batch of experiences."""
+        states, actions, rewards, next_states, dones = self._validate_training_batch(
+            states, actions, rewards, next_states, dones
+        )
 
-        Args:
-            states: State batch [batch_size, state_size]
-            actions: Action batch [batch_size]
-            rewards: Reward batch [batch_size]
-            next_states: Next state batch [batch_size, state_size]
-            dones: Done flags [batch_size]
-
-        Returns:
-            Loss value
-        """
         with tf.device(self.device_name):
-            states = tf.convert_to_tensor(states, dtype=tf.float32)
-            actions = tf.convert_to_tensor(actions, dtype=tf.int32)
-            rewards = tf.convert_to_tensor(rewards, dtype=tf.float32)
-            next_states = tf.convert_to_tensor(next_states, dtype=tf.float32)
-            dones = tf.convert_to_tensor(dones, dtype=tf.float32)
-            
+            states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
+            actions_tensor = tf.convert_to_tensor(actions, dtype=tf.int32)
+            rewards_tensor = tf.convert_to_tensor(rewards, dtype=tf.float32)
+            next_states_tensor = tf.convert_to_tensor(next_states, dtype=tf.float32)
+            dones_tensor = tf.convert_to_tensor(dones, dtype=tf.float32)
+
             with tf.GradientTape() as tape:
-                # Predict Q-values
-                q_values = self.network(states, training=True)
-                
-                # Get current Q-values for actions taken
-                batch_indices = tf.range(tf.shape(q_values)[0])
-                action_indices = tf.stack([batch_indices, actions], axis=1)
+                q_values = self.network(states_tensor, training=True)
+                batch_indices = tf.range(tf.shape(q_values)[0], dtype=tf.int32)
+                action_indices = tf.stack([batch_indices, actions_tensor], axis=1)
                 current_q = tf.gather_nd(q_values, action_indices)
-                
-                # Compute target Q-values
-                next_q_values = self.target_network(next_states, training=False)
+
+                next_q_values = self.target_network(next_states_tensor, training=False)
                 max_next_q = tf.reduce_max(next_q_values, axis=1)
-                target_q = rewards + self.gamma * max_next_q * (1.0 - dones)
-                
-                # Compute loss
+                target_q = rewards_tensor + self.gamma * max_next_q * (1.0 - dones_tensor)
+                target_q = tf.stop_gradient(target_q)
+
                 loss = self.loss_fn(target_q, current_q)
-            
-            # Update weights
+
+            if not tf.math.is_finite(loss):
+                raise ValueError("training produced a non-finite loss value")
+
             gradients = tape.gradient(loss, self.network.trainable_weights)
-            self.optimizer.apply_gradients(
-                zip(gradients, self.network.trainable_weights)
-            )
-            
+            gradients_and_weights = [
+                (gradient, weight)
+                for gradient, weight in zip(gradients, self.network.trainable_weights)
+                if gradient is not None
+            ]
+            if not gradients_and_weights:
+                raise RuntimeError("no gradients were produced during the training step")
+
+            self.optimizer.apply_gradients(gradients_and_weights)
             self.train_loss.update_state(loss)
-            return loss.numpy()
+
+            return float(loss.numpy())
 
     def update_target_network(self) -> None:
-        """Update target network weights from main network."""
-        if self.model_type == "dqn":
-            self.target_network.set_weights(self.network.get_weights())
+        """Synchronize target network weights from the online network."""
+        self.target_network.set_weights(self.network.get_weights())
 
     def decay_epsilon(self) -> None:
-        """Decay epsilon for exploration."""
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        """Decay epsilon while respecting the configured minimum value."""
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def get_model_summary(self) -> str:
-        """
-        Get model architecture summary.
+        """Return the model summary as a string."""
+        buffer = io.StringIO()
+        self.network.summary(print_fn=lambda line: buffer.write(line + os.linesep))
+        return buffer.getvalue().strip()
 
-        Returns:
-            Model summary string
-        """
-        self.network.build((None, self.state_size))
-        return str(self.network.summary())
+    def get_config(self) -> Dict[str, Any]:
+        """Return serializable model configuration metadata."""
+        return {
+            "state_size": self.state_size,
+            "action_size": self.action_size,
+            "learning_rate": self.learning_rate,
+            "gamma": self.gamma,
+            "epsilon": self.epsilon,
+            "epsilon_decay": self.epsilon_decay,
+            "epsilon_min": self.epsilon_min,
+            "model_type": self.model_type,
+            "device": self.device,
+            "hidden_layers": list(self.hidden_layers),
+            "dropout_rate": self.dropout_rate,
+            "use_batch_norm": self.use_batch_norm,
+            "gradient_clip_norm": self.gradient_clip_norm,
+            "seed": self.seed,
+        }
 
     def save_model(self, filepath: str) -> None:
-        """
-        Save model weights to file.
+        """Save online network weights to a validated filesystem path."""
+        if not filepath or not isinstance(filepath, str):
+            raise ValueError("filepath must be a non-empty string")
 
-        Args:
-            filepath: Path to save model
-        """
+        directory = os.path.dirname(filepath)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
         self.network.save_weights(filepath)
-        logger.info(f"Model saved to {filepath}")
+        logger.info("Model weights saved to %s", filepath)
 
     def load_model(self, filepath: str) -> None:
-        """
-        Load model weights from file.
+        """Load online network weights and re-synchronize the target network."""
+        if not filepath or not isinstance(filepath, str):
+            raise ValueError("filepath must be a non-empty string")
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"model weights file not found: {filepath}")
 
-        Args:
-            filepath: Path to load model from
-        """
         self.network.load_weights(filepath)
-        if self.model_type == "dqn":
-            self.target_network.set_weights(self.network.get_weights())
-        logger.info(f"Model loaded from {filepath}")
+        self.update_target_network()
+        logger.info("Model weights loaded from %s", filepath)
 
 
 class ExperienceReplay:
-    """Experience replay buffer for storing and sampling agent experiences."""
+    """Experience replay buffer for storing and sampling DQN experiences."""
 
-    def __init__(self, max_size: int = 100000):
-        """
-        Initialize experience replay buffer.
+    def __init__(self, state_size: int, max_size: int = 100000, seed: Optional[int] = None):
+        if state_size <= 0:
+            raise ValueError("state_size must be a positive integer")
+        if max_size <= 0:
+            raise ValueError("max_size must be a positive integer")
 
-        Args:
-            max_size: Maximum buffer size
-        """
+        self.state_size = state_size
         self.max_size = max_size
-        self.buffer = []
+        self.buffer: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
         self.position = 0
+        self.rng = np.random.default_rng(seed)
 
     def add(
         self,
@@ -387,86 +453,99 @@ class ExperienceReplay:
         action: int,
         reward: float,
         next_state: np.ndarray,
-        done: bool
+        done: bool,
     ) -> None:
-        """
-        Add experience to buffer.
+        """Add a validated experience to the replay buffer."""
+        state_array = np.asarray(state, dtype=np.float32)
+        next_state_array = np.asarray(next_state, dtype=np.float32)
 
-        Args:
-            state: Current state
-            action: Action taken
-            reward: Reward received
-            next_state: Next state
-            done: Whether episode is done
-        """
-        experience = (state, action, reward, next_state, done)
-        
+        if state_array.shape != (self.state_size,):
+            raise ValueError(
+                f"state must have shape ({self.state_size},), received {state_array.shape}"
+            )
+        if next_state_array.shape != (self.state_size,):
+            raise ValueError(
+                f"next_state must have shape ({self.state_size},), received {next_state_array.shape}"
+            )
+        if not np.all(np.isfinite(state_array)):
+            raise ValueError("state contains NaN or infinite values")
+        if not np.all(np.isfinite(next_state_array)):
+            raise ValueError("next_state contains NaN or infinite values")
+        if not isinstance(action, (int, np.integer)):
+            raise TypeError("action must be an integer")
+        if not np.isfinite(reward):
+            raise ValueError("reward must be finite")
+
+        experience = (
+            state_array.copy(),
+            int(action),
+            float(reward),
+            next_state_array.copy(),
+            bool(done),
+        )
+
         if len(self.buffer) < self.max_size:
             self.buffer.append(experience)
         else:
             self.buffer[self.position] = experience
-        
+
         self.position = (self.position + 1) % self.max_size
 
-    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Sample a batch of experiences.
+    def sample(
+        self, batch_size: int
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Sample a batch of experiences from the replay buffer."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        if not self.buffer:
+            raise ValueError("cannot sample from an empty replay buffer")
 
-        Args:
-            batch_size: Size of batch to sample
+        actual_batch_size = min(batch_size, len(self.buffer))
+        indices = self.rng.choice(len(self.buffer), actual_batch_size, replace=False)
+        experiences = [self.buffer[index] for index in indices]
 
-        Returns:
-            Tuple of (states, actions, rewards, next_states, dones)
-        """
-        if batch_size > len(self.buffer):
-            batch_size = len(self.buffer)
-        
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        experiences = [self.buffer[i] for i in indices]
-        
-        states = np.array([e[0] for e in experiences])
-        actions = np.array([e[1] for e in experiences])
-        rewards = np.array([e[2] for e in experiences])
-        next_states = np.array([e[3] for e in experiences])
-        dones = np.array([e[4] for e in experiences], dtype=np.float32)
-        
+        states = np.stack([experience[0] for experience in experiences]).astype(np.float32)
+        actions = np.asarray([experience[1] for experience in experiences], dtype=np.int32)
+        rewards = np.asarray([experience[2] for experience in experiences], dtype=np.float32)
+        next_states = np.stack([experience[3] for experience in experiences]).astype(np.float32)
+        dones = np.asarray([experience[4] for experience in experiences], dtype=np.float32)
+
         return states, actions, rewards, next_states, dones
 
     def __len__(self) -> int:
-        """Get buffer size."""
+        """Return the current replay buffer size."""
         return len(self.buffer)
 
 
 if __name__ == "__main__":
-    # Example usage
-    logger.info("Creating example agent learning model...")
-    
-    # Create model
+    logging.basicConfig(level=logging.INFO)
+    logger.info("Creating example DQN agent learning model...")
+
     model = AgentLearningModel(
         state_size=64,
         action_size=10,
         learning_rate=0.001,
         model_type="dqn",
-        device="cpu"
+        device="cpu",
+        seed=42,
     )
-    
-    # Create experience replay
-    replay = ExperienceReplay(max_size=10000)
-    
-    # Simulate some experience
-    for i in range(100):
-        state = np.random.randn(64)
+
+    replay = ExperienceReplay(state_size=64, max_size=10000, seed=42)
+
+    for _ in range(100):
+        state = np.random.randn(64).astype(np.float32)
         action = model.select_action(state)
-        reward = np.random.randn()
-        next_state = np.random.randn(64)
-        done = np.random.random() > 0.9
-        
+        reward = float(np.random.randn())
+        next_state = np.random.randn(64).astype(np.float32)
+        done = bool(np.random.random() > 0.9)
         replay.add(state, action, reward, next_state, done)
-    
-    # Train on batch
-    if len(replay) > 32:
+
+    if len(replay) >= 32:
         states, actions, rewards, next_states, dones = replay.sample(32)
         loss = model.train_step(states, actions, rewards, next_states, dones)
-        logger.info(f"Training loss: {loss}")
-    
-    logger.info("Example training completed successfully!")
+        model.decay_epsilon()
+        model.update_target_network()
+        logger.info("Training loss: %s", loss)
+        logger.info("Current epsilon: %s", model.epsilon)
+
+    logger.info("Example training completed successfully")
