@@ -106,7 +106,8 @@ def test_dependency_validation_and_queue_ordering_are_deterministic():
         priority=TaskPriority.HIGH,
     )
 
-    assert [task.id for task in system.global_task_queue[:2]] == [high_priority.id, low_priority.id]
+    assert len(system.global_task_queue) == 2
+    assert [task.id for task in system.global_task_queue] == [high_priority.id, low_priority.id]
 
     with pytest.raises(ValueError, match="Unknown task dependencies"):
         system.create_task(

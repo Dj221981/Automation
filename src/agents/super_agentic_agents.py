@@ -859,6 +859,9 @@ class AgentSystem:
 
         for dependency_id in task.dependencies:
             dependency = self.task_registry.get(dependency_id)
+            if dependency is None:
+                logger.error(f"Task {task.id} lost dependency reference {dependency_id}")
+                return False
             if dependency.status != TaskStatus.COMPLETED:
                 logger.info(
                     f"Task {task.id} is waiting on dependency {dependency_id} "
