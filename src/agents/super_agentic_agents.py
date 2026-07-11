@@ -171,7 +171,7 @@ class Task:
             status_history.append({
                 "from": None,
                 "to": self.status.value,
-                "timestamp": self.created_at.isoformat()
+                "timestamp": datetime.now().isoformat()
             })
         self.metadata["status_history"] = status_history
 
@@ -553,7 +553,7 @@ class OrchestratorAgent(BaseAgent):
             return None
 
         # Simple scoring: prefer less busy agents
-        return min(available_agents, key=lambda a: (len(a.active_tasks), a.created_at, a.id))
+        return min(available_agents, key=lambda a: (len(a.active_tasks), a.last_activity, a.id))
 
     def get_system_status(self) -> Dict[str, Any]:
         """Get status of entire agent system."""
@@ -859,9 +859,6 @@ class AgentSystem:
 
         for dependency_id in task.dependencies:
             dependency = self.task_registry.get(dependency_id)
-            if not dependency:
-                logger.warning(f"Task {task.id} has unknown dependency {dependency_id}")
-                return False
             if dependency.status != TaskStatus.COMPLETED:
                 logger.info(
                     f"Task {task.id} is waiting on dependency {dependency_id} "
