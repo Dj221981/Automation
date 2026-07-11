@@ -171,9 +171,14 @@ class Task:
             status_history.append({
                 "from": None,
                 "to": self.status.value,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": self._timestamp()
             })
         self.metadata["status_history"] = status_history
+
+    @staticmethod
+    def _timestamp() -> str:
+        """Return a consistent ISO-formatted timestamp for task events."""
+        return datetime.now().isoformat()
 
     @staticmethod
     def _coerce_status(status: Any) -> TaskStatus:
@@ -219,13 +224,17 @@ class Task:
         self.metadata.setdefault("status_history", []).append({
             "from": previous_status.value,
             "to": new_status.value,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": self._timestamp()
         })
 
     def duration_seconds(self) -> Optional[float]:
         """Return task execution duration in seconds when available."""
         if self.started_at and self.completed_at:
-            return max((self.completed_at - self.started_at).total_seconds(), 0.0)
+            duration = (self.completed_at - self.started_at).total_seconds()
+            if duration < 0:
+                logger.warning(f"Task {self.id} reported negative duration {duration}; clamping to 0.0")
+                return 0.0
+            return duration
         return None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -294,6 +303,7 @@ class BaseAgent(ABC):
             "avg_task_time": 0.0,
             "success_rate": 1.0
         }
+        self._total_task_time = 0.0
 
         logger.info(f"Initialized {self.role.value} agent: {self.name} (ID: {self.id})")
 
@@ -432,10 +442,8 @@ class BaseAgent(ABC):
         failed = self.performance_metrics["tasks_failed"]
         total = completed + failed
         if duration is not None and total > 0:
-            previous_total_duration = self.performance_metrics["avg_task_time"] * (total - 1)
-            self.performance_metrics["avg_task_time"] = (
-                previous_total_duration + duration
-            ) / total
+            self._total_task_time += duration
+            self.performance_metrics["avg_task_time"] = self._total_task_time / total
 
         self.performance_metrics["success_rate"] = (
             completed / total if total > 0 else 0
@@ -552,7 +560,8 @@ class OrchestratorAgent(BaseAgent):
         if not available_agents:
             return None
 
-        # Simple scoring: prefer less busy agents
+        # Prefer agents with fewer active tasks, then the least recently active agent
+        # to balance work while keeping the selection deterministic.
         return min(available_agents, key=lambda a: (len(a.active_tasks), a.last_activity, a.name))
 
     def get_system_status(self) -> Dict[str, Any]:
@@ -698,6 +707,7 @@ class AgentSystem:
             "failed_tasks": 0,
             "avg_task_duration": 0.0
         }
+        self._total_task_duration = 0.0
 
         logger.info(f"Initialized Agent System: {self.name}")
 
@@ -862,7 +872,8 @@ class AgentSystem:
     def _prepare_task_for_assignment(self, task: Task) -> bool:
         """Validate task state before assignment to an agent."""
         if not isinstance(task, Task):
-            raise TypeError("task must be a Task instance")
+            logger.warning("Ignoring non-Task submission")
+            return False
         if not self._register_external_task(task):
             return False
         if task.is_terminal():
@@ -920,12 +931,10 @@ class AgentSystem:
         )
         duration = task.duration_seconds()
         if duration is not None and total_terminal_tasks > 0:
-            previous_total_duration = (
-                self.system_metrics["avg_task_duration"] * (total_terminal_tasks - 1)
-            )
+            self._total_task_duration += duration
             self.system_metrics["avg_task_duration"] = (
-                previous_total_duration + duration
-            ) / total_terminal_tasks
+                self._total_task_duration / total_terminal_tasks
+            )
 
         logger.info(
             f"Task {task.id} finished on agent {agent.name} "

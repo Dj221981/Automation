@@ -71,9 +71,10 @@ def test_task_failure_updates_metrics(monkeypatch):
 
     monkeypatch.setattr(executor, "act", fail_task)
 
-    with pytest.raises(RuntimeError, match="simulated failure"):
+    with pytest.raises(RuntimeError, match="simulated failure") as exc_info:
         executor.execute_task(task)
 
+    assert str(exc_info.value) == "simulated failure"
     assert task.status == TaskStatus.FAILED
     assert task.error == "simulated failure"
     assert executor.status == AgentStatus.IDLE
