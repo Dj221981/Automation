@@ -126,6 +126,7 @@ class AgentLearningModel:
         use_batch_norm: bool = False,
         gradient_clip_norm: float = 10.0,
         seed: Optional[int] = None,
+        target_update_interval: int = 1000,
     ):
         self._validate_configuration(
             state_size=state_size,
@@ -138,6 +139,7 @@ class AgentLearningModel:
             model_type=model_type,
             device=device,
             gradient_clip_norm=gradient_clip_norm,
+            target_update_interval=target_update_interval,
         )
 
         self.state_size = state_size
@@ -154,6 +156,8 @@ class AgentLearningModel:
         self.use_batch_norm = use_batch_norm
         self.gradient_clip_norm = gradient_clip_norm
         self.seed = seed
+        self.target_update_interval = target_update_interval
+        self.train_steps = 0
 
         if seed is not None:
             np.random.seed(seed)
@@ -206,6 +210,7 @@ class AgentLearningModel:
         model_type: str,
         device: str,
         gradient_clip_norm: float,
+        target_update_interval: int,
     ) -> None:
         if state_size <= 0:
             raise ValueError("state_size must be a positive integer")
@@ -233,6 +238,8 @@ class AgentLearningModel:
             )
         if gradient_clip_norm <= 0:
             raise ValueError("gradient_clip_norm must be greater than 0")
+        if target_update_interval <= 0:
+            raise ValueError("target_update_interval must be greater than 0")
 
     def _resolve_device_name(self, device: str) -> str:
         if device == "gpu":
@@ -282,12 +289,6 @@ class AgentLearningModel:
                 f"next_states must have shape [batch_size, {self.state_size}], received {next_states.shape}"
             )
         batch_size = states.shape[0]
-        expected_shapes = {
-            "actions": actions.shape,
-            "rewards": rewards.shape,
-            "dones": dones.shape,
-            "next_states": next_states.shape,
-        }
         if batch_size == 0:
             raise ValueError("training batch must contain at least one sample")
         if actions.shape != (batch_size,):
@@ -373,6 +374,10 @@ class AgentLearningModel:
             self.optimizer.apply_gradients(gradients_and_weights)
             self.train_loss.update_state(loss)
 
+            self.train_steps += 1
+            if self.train_steps % self.target_update_interval == 0:
+                self.update_target_network()
+
             return float(loss.numpy())
 
     def update_target_network(self) -> None:
@@ -406,6 +411,7 @@ class AgentLearningModel:
             "use_batch_norm": self.use_batch_norm,
             "gradient_clip_norm": self.gradient_clip_norm,
             "seed": self.seed,
+            "target_update_interval": self.target_update_interval,
         }
 
     def save_model(self, filepath: str) -> None:
