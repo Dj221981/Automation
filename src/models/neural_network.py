@@ -19,7 +19,7 @@ from __future__ import annotations
 import io
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -394,7 +394,7 @@ class AgentLearningModel:
         self.network.summary(print_fn=lambda line: buffer.write(line + os.linesep))
         return buffer.getvalue().strip()
 
-    def get_config(self) -> Dict[str, Any]:
+    def get_config(self) -> Dict[str, float | int | str | List[int] | bool | None]:
         """Return serializable model configuration metadata."""
         return {
             "state_size": self.state_size,
@@ -415,7 +415,7 @@ class AgentLearningModel:
         }
 
     def save_model(self, filepath: str) -> None:
-        """Save online network weights to a validated filesystem path."""
+        """Save online network weights and lightweight metadata to disk."""
         if not filepath or not isinstance(filepath, str):
             raise ValueError("filepath must be a non-empty string")
 
@@ -423,17 +423,28 @@ class AgentLearningModel:
         if directory:
             os.makedirs(directory, exist_ok=True)
 
+        metadata_path = f"{filepath}.meta.npz"
+        np.savez(metadata_path, train_steps=np.asarray(self.train_steps, dtype=np.int64))
+
         self.network.save_weights(filepath)
         logger.info("Model weights saved to %s", filepath)
 
     def load_model(self, filepath: str) -> None:
-        """Load online network weights and re-synchronize the target network."""
+        """Load online network weights, metadata, and re-synchronize the target network."""
         if not filepath or not isinstance(filepath, str):
             raise ValueError("filepath must be a non-empty string")
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"model weights file not found: {filepath}")
 
         self.network.load_weights(filepath)
+
+        metadata_path = f"{filepath}.meta.npz"
+        if os.path.exists(metadata_path):
+            metadata = np.load(metadata_path)
+            self.train_steps = int(metadata["train_steps"])
+        else:
+            self.train_steps = 0
+
         self.update_target_network()
         logger.info("Model weights loaded from %s", filepath)
 
