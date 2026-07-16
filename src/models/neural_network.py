@@ -550,7 +550,6 @@ if __name__ == "__main__":
         states, actions, rewards, next_states, dones = replay.sample(32)
         loss = model.train_step(states, actions, rewards, next_states, dones)
         model.decay_epsilon()
-        model.update_target_network()
         logger.info("Training loss: %s", loss)
         logger.info("Current epsilon: %s", model.epsilon)
 
