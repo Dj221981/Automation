@@ -46,17 +46,17 @@ def test_agent_learning_model_config_validation_errors():
         AgentLearningModel(state_size=4, action_size=2, device="tpu")
     with pytest.raises(ValueError):
         AgentLearningModel(state_size=4, action_size=2, gradient_clip_norm=0)
+    with pytest.raises(ValueError):
+        AgentLearningModel(state_size=4, action_size=2, target_update_interval=0)
 
 
 def test_select_action_output_range_training_and_eval():
     model = AgentLearningModel(state_size=4, action_size=3, seed=123)
     state = np.zeros(4, dtype=np.float32)
 
-    # Evaluation path (greedy)
     action_eval = model.select_action(state, training=False)
     assert 0 <= action_eval < 3
 
-    # Training path (epsilon-greedy)
     model.epsilon = 1.0
     action_train = model.select_action(state, training=True)
     assert 0 <= action_train < 3
@@ -90,6 +90,35 @@ def test_train_step_returns_finite_loss_and_updates_metric():
     assert model.train_loss.result().numpy() > 0 or model.train_loss.result().numpy() == 0
 
 
+def test_train_step_returns_float_and_increments_train_steps():
+    model = AgentLearningModel(
+        state_size=4,
+        action_size=3,
+        seed=123,
+        target_update_interval=2,
+    )
+    batch = _valid_batch()
+    before = model.train_steps
+    loss = model.train_step(*batch)
+    assert isinstance(loss, float)
+    assert np.isfinite(loss)
+    assert model.train_steps == before + 1
+
+
+def test_train_step_auto_target_sync_runs_on_interval():
+    model = AgentLearningModel(
+        state_size=4,
+        action_size=3,
+        seed=123,
+        target_update_interval=1,
+    )
+    batch = _valid_batch()
+    loss = model.train_step(*batch)
+    assert isinstance(loss, float)
+    for online_weight, target_weight in zip(model.network.get_weights(), model.target_network.get_weights()):
+        np.testing.assert_allclose(online_weight, target_weight, rtol=1e-5, atol=1e-6)
+
+
 def test_train_step_validation_failures():
     model = AgentLearningModel(state_size=4, action_size=3)
     states, actions, rewards, next_states, dones = _valid_batch(state_size=4, batch_size=8, action_size=3)
@@ -109,6 +138,17 @@ def test_train_step_validation_failures():
     bad_states[0, 0] = np.nan
     with pytest.raises(ValueError):
         model.train_step(bad_states, actions, rewards, next_states, dones)
+
+
+def test_train_step_rejects_empty_batch():
+    model = AgentLearningModel(state_size=4, action_size=3)
+    states = np.zeros((0, 4), dtype=np.float32)
+    actions = np.zeros((0,), dtype=np.int32)
+    rewards = np.zeros((0,), dtype=np.float32)
+    next_states = np.zeros((0, 4), dtype=np.float32)
+    dones = np.zeros((0,), dtype=np.float32)
+    with pytest.raises(ValueError):
+        model.train_step(states, actions, rewards, next_states, dones)
 
 
 def test_update_target_network_synchronizes_weights():
@@ -212,7 +252,6 @@ def test_experience_replay_sample_shapes_and_errors():
     assert next_states.shape == (3, 4)
     assert dones.shape == (3,)
 
-    # Requesting bigger batch than available should clamp to len(buffer)
     states2, actions2, rewards2, next_states2, dones2 = replay.sample(99)
     assert states2.shape[0] == 5
     assert actions2.shape[0] == 5
