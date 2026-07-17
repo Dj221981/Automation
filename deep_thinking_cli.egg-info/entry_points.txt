@@ -1,0 +1,2 @@
+[console_scripts]
+deep-thinking = deep_thinking:main

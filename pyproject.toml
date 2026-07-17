@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-thinking-cli"
+version = "0.1.0"
+description = "Production-ready deep thinking CLI utility"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Dj221981" }
+]
+license = { text = "MIT" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Environment :: Console",
+]
+
+[project.scripts]
+deep-thinking = "deep_thinking:main"
+
+[tool.setuptools]
+py-modules = ["deep_thinking"]
