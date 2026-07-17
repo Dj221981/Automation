@@ -1,0 +1,46 @@
+{
+  "model": {
+    "state_size": 64,
+    "action_size": 8,
+    "hidden_layers": [128, 64],
+    "learning_rate": 0.001,
+    "gamma": 0.99,
+    "epsilon": 1.0,
+    "epsilon_decay": 0.995,
+    "epsilon_min": 0.01,
+    "dropout_rate": 0.2,
+    "use_batch_norm": true,
+    "gradient_clip_norm": 10.0,
+    "device": "cpu",
+    "target_update_interval": 1000
+  },
+  "training": {
+    "batch_size": 32,
+    "replay_buffer_size": 100000,
+    "num_episodes": 1000,
+    "steps_per_episode": 500,
+    "min_replay_size": 1000,
+    "update_frequency": 4
+  },
+  "preprocessing": {
+    "normalization_type": "minmax",
+    "normalization_epsilon": 1e-8,
+    "state_features": 64,
+    "augmentation": {
+      "enabled": true,
+      "noise_std": 0.1,
+      "augmentation_probability": 0.3
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "log_file": "logs/training.log",
+    "tensorboard_dir": "logs/tensorboard"
+  },
+  "checkpointing": {
+    "enabled": true,
+    "save_interval": 1000,
+    "save_dir": "checkpoints/",
+    "keep_last_n": 5
+  }
+}
