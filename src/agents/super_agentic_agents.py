@@ -22,11 +22,12 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+BASE_RETRY_BACKOFF_SECONDS = 1
 
 
 class AgentRole(Enum):
@@ -136,11 +137,40 @@ class Task:
     status: TaskStatus = TaskStatus.PENDING
     created_at: datetime = field(default_factory=datetime.now)
     completed_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    last_attempt_at: Optional[datetime] = None
+    next_retry_at: Optional[datetime] = None
+    retry_count: int = 0
+    # max_retries is the number of retries after the initial execution attempt.
+    # max_retries=0 means no retries are allowed (one total attempt).
+    max_retries: int = 0
     result: Any = None
     error: Optional[str] = None
     parameters: Dict[str, Any] = field(default_factory=dict)
     dependencies: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    _ALLOWED_TRANSITIONS = {
+        TaskStatus.PENDING: {TaskStatus.ASSIGNED, TaskStatus.CANCELLED},
+        TaskStatus.ASSIGNED: {TaskStatus.RUNNING, TaskStatus.CANCELLED},
+        TaskStatus.RUNNING: {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.FAILED: {TaskStatus.PENDING, TaskStatus.CANCELLED},
+        TaskStatus.COMPLETED: set(),
+        TaskStatus.CANCELLED: set(),
+    }
+
+    @classmethod
+    def can_transition(cls, current: TaskStatus, new: TaskStatus) -> bool:
+        return new in cls._ALLOWED_TRANSITIONS.get(current, set())
+
+    def transition_to(self, new_status: TaskStatus) -> None:
+        if self.status == new_status:
+            return
+        if not self.can_transition(self.status, new_status):
+            raise ValueError(
+                f"Invalid task status transition for task {self.id}: {self.status.value} -> {new_status.value}"
+            )
+        self.status = new_status
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -150,7 +180,12 @@ class Task:
             "assigned_to": self.assigned_to,
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "last_attempt_at": self.last_attempt_at.isoformat() if self.last_attempt_at else None,
+            "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "retry_count": self.retry_count,
+            "max_retries": self.max_retries,
             "result": self.result,
             "error": self.error,
             "parameters": self.parameters,
@@ -214,9 +249,9 @@ class BaseAgent(ABC):
         return list(self.capabilities.keys())
 
     def assign_task(self, task: Task) -> bool:
+        task.transition_to(TaskStatus.ASSIGNED)
         self.active_tasks[task.id] = task
         task.assigned_to = self.id
-        task.status = TaskStatus.ASSIGNED
         self.memory.store_episode(f"task:{task.id}", task)
         self._touch()
         logger.info("Task %s assigned to agent %s", task.id, self.name)
@@ -225,14 +260,17 @@ class BaseAgent(ABC):
     def execute_task(self, task: Task) -> Any:
         start_time = datetime.now()
         self.status = AgentStatus.BUSY
-        task.status = TaskStatus.RUNNING
+        task.last_attempt_at = start_time
+        if task.started_at is None:
+            task.started_at = start_time
+        task.transition_to(TaskStatus.RUNNING)
         self._touch()
         logger.info("Agent %s executing task %s", self.name, task.id)
 
         try:
             reasoning = self.think(task.parameters)
             result = self.act(reasoning)
-            task.status = TaskStatus.COMPLETED
+            task.transition_to(TaskStatus.COMPLETED)
             task.result = result
             task.completed_at = datetime.now()
             self._update_metrics(task, success=True, start_time=start_time)
@@ -241,7 +279,7 @@ class BaseAgent(ABC):
             logger.info("Task %s completed successfully", task.id)
             return result
         except Exception as exc:
-            task.status = TaskStatus.FAILED
+            task.transition_to(TaskStatus.FAILED)
             task.error = str(exc)
             task.completed_at = datetime.now()
             self._update_metrics(task, success=False, start_time=start_time)
@@ -408,6 +446,8 @@ class AgentSystem:
             "failed_tasks": 0,
             "avg_task_duration": 0.0,
         }
+        self._completed_task_count = 0
+        self._completed_task_duration_total = 0.0
         logger.info("Initialized Agent System: %s", self.name)
 
     def add_agent(self, agent: BaseAgent) -> bool:
@@ -445,6 +485,97 @@ class AgentSystem:
             return self.orchestrator.distribute_task(task)
         logger.warning("Failed to submit task %s", task.id)
         return False
+
+    def _remove_from_pending_queue(self, task: Task) -> None:
+        self.global_task_queue = [queued for queued in self.global_task_queue if queued.id != task.id]
+
+    def _record_terminal_task_outcome(self, task: Task, success: bool) -> None:
+        if task.started_at is None and task.last_attempt_at is not None:
+            logger.warning("Task %s missing started_at; falling back to last_attempt_at for duration", task.id)
+        duration_start = task.started_at if task.started_at is not None else task.last_attempt_at
+        if task.completed_at is not None and duration_start is not None:
+            self._completed_task_duration_total += (task.completed_at - duration_start).total_seconds()
+            self._completed_task_count += 1
+            self.system_metrics["avg_task_duration"] = self._completed_task_duration_total / self._completed_task_count
+        if success:
+            self.system_metrics["successful_tasks"] += 1
+        else:
+            self.system_metrics["failed_tasks"] += 1
+
+    def process_task(self, task_id: str, agent_id: Optional[str] = None) -> bool:
+        task = next((queued for queued in self.global_task_queue if queued.id == task_id), None)
+        if task is None:
+            logger.warning("Task %s not found in pending queue", task_id)
+            return False
+
+        assigned_agent: Optional[BaseAgent] = None
+        if agent_id:
+            assigned_agent = self.get_agent(agent_id)
+            if assigned_agent is None:
+                raise ValueError(f"Agent '{agent_id}' not found")
+
+        if task.assigned_to:
+            assigned_agent = self.get_agent(task.assigned_to)
+        elif assigned_agent:
+            assigned_agent.assign_task(task)
+        else:
+            assigned = self.orchestrator.distribute_task(task)
+            if assigned and task.assigned_to:
+                assigned_agent = self.get_agent(task.assigned_to)
+
+        if assigned_agent is None:
+            logger.warning("Unable to assign task %s", task.id)
+            return False
+
+        try:
+            assigned_agent.execute_task(task)
+        except Exception:
+            logger.exception("Task %s execution failed on agent %s", task.id, assigned_agent.id)
+            if task.retry_count < task.max_retries:
+                task.retry_count += 1
+                backoff_seconds = BASE_RETRY_BACKOFF_SECONDS * max(1, task.retry_count)
+                task.next_retry_at = datetime.now() + timedelta(seconds=backoff_seconds)
+                task.metadata["retry_backoff_seconds"] = backoff_seconds
+                task.transition_to(TaskStatus.PENDING)
+                task.assigned_to = None
+                task.completed_at = None
+                task.error = None
+                return False
+
+            self._remove_from_pending_queue(task)
+            self.completed_tasks.append(task)
+            self._record_terminal_task_outcome(task, success=False)
+            return False
+
+        self._remove_from_pending_queue(task)
+        self.completed_tasks.append(task)
+        self._record_terminal_task_outcome(task, success=True)
+        return True
+
+    def process_pending_tasks(self, max_tasks: Optional[int] = None) -> Dict[str, Any]:
+        processed = 0
+        success = 0
+        terminal_failures = 0
+        task_ids = [task.id for task in self.global_task_queue]
+
+        for task_id in task_ids:
+            if max_tasks is not None and processed >= max_tasks:
+                break
+            result = self.process_task(task_id)
+            processed += 1
+            if result:
+                success += 1
+            else:
+                task = next((completed for completed in self.completed_tasks if completed.id == task_id), None)
+                if task and task.status == TaskStatus.FAILED:
+                    terminal_failures += 1
+
+        return {
+            "processed": processed,
+            "successful": success,
+            "failed": terminal_failures,
+            "remaining_pending": len(self.global_task_queue),
+        }
 
     def get_system_status(self) -> Dict[str, Any]:
         return {
