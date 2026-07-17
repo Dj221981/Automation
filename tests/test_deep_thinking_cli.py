@@ -6,6 +6,7 @@ from deep_thinking import (
     DeepThinker,
     MAX_DEPTH,
     MAX_TOPIC_LENGTH,
+    configure_logging,
     depth_type,
     parse_args,
     sanitize_topic,
@@ -28,7 +29,7 @@ def test_seeded_output_is_reproducible():
 
 def test_summary_contains_depth_and_topic():
     thinker = DeepThinker(topic="ops", depth=2, seed=1)
-    summary = thinker.summarize(thinker.think())
+    summary = thinker.summarize()
     assert "After 2 deep-thinking steps on 'ops'" in summary
 
 
@@ -50,4 +51,24 @@ def test_parse_args_default_and_flags():
     assert args.depth == 2
     assert args.verbose is True
     assert args.quiet is False
+    assert args.seed is None
     assert args.topic == "deep ai thinking"
+
+    seeded_args = parse_args(["--depth", "2", "--seed", "42"])
+    assert seeded_args.seed == 42
+
+
+def test_parse_args_positional_topic_and_defaults():
+    args = parse_args(["automation"])
+    assert args.topic == "automation"
+    assert args.depth == 5
+
+
+def test_parse_args_rejects_invalid_depth():
+    with pytest.raises(SystemExit):
+        parse_args(["--depth", "0"])
+
+
+def test_configure_logging_mutual_exclusivity():
+    with pytest.raises(ValueError):
+        configure_logging(verbose=True, quiet=True)

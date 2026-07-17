@@ -21,6 +21,9 @@ __all__ = [
     "DeepThinker",
     "MAX_DEPTH",
     "MAX_TOPIC_LENGTH",
+    "sanitize_topic",
+    "depth_type",
+    "configure_logging",
     "parse_args",
     "run",
     "main",
@@ -71,12 +74,16 @@ class DeepThinker:
 
         return thoughts
 
-    def summarize(self, thoughts: List[str]) -> str:
+    def summarize(self, thoughts: Optional[List[str]] = None) -> str:
         """Create a compact summary after thinking."""
-        del thoughts
+        insight_count = 0
+        if thoughts:
+            insight_count = sum(1 for line in thoughts if line.strip().startswith("Insight:"))
+
         return (
             f"Summary: After {self.depth} deep-thinking steps on '{self.topic}', "
-            "the best path is to define clear goals, test assumptions, and iterate quickly."
+            f"{insight_count or self.depth} insights were generated. "
+            "The best path is to define clear goals, test assumptions, and iterate quickly."
         )
 
 
@@ -189,13 +196,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
 
 def main() -> None:
     """CLI entrypoint with explicit process exit behavior."""
-    try:
-        raise SystemExit(run())
-    except SystemExit:
-        raise
-    except Exception as exc:
-        print(f"Fatal error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
+    sys.exit(run())
 
 
 if __name__ == "__main__":
