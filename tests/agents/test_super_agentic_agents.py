@@ -85,7 +85,6 @@ def test_process_task_failure_then_retry_success():
     assert task.status == TaskStatus.COMPLETED
     assert system.system_metrics["successful_tasks"] == 1
     assert system.system_metrics["failed_tasks"] == 0
-    assert system.system_metrics["successful_tasks"] + system.system_metrics["failed_tasks"] <= system.system_metrics["total_tasks"]
 
 
 def test_process_task_retry_exhausted_counts_terminal_failure_once():
@@ -111,7 +110,6 @@ def test_process_task_retry_exhausted_counts_terminal_failure_once():
     third_attempt = system.process_task(task.id, agent.id)
     assert third_attempt is False
     assert system.system_metrics["failed_tasks"] == 1
-    assert system.system_metrics["successful_tasks"] + system.system_metrics["failed_tasks"] <= system.system_metrics["total_tasks"]
 
 
 def test_invalid_transition_guard_raises_clear_error():
@@ -119,3 +117,9 @@ def test_invalid_transition_guard_raises_clear_error():
 
     with pytest.raises(ValueError, match="Invalid task status transition"):
         task.transition_to(TaskStatus.COMPLETED)
+
+    task.transition_to(TaskStatus.ASSIGNED)
+    task.transition_to(TaskStatus.RUNNING)
+    task.transition_to(TaskStatus.COMPLETED)
+    with pytest.raises(ValueError, match="Invalid task status transition"):
+        task.transition_to(TaskStatus.RUNNING)

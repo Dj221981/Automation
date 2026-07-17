@@ -22,11 +22,12 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+BASE_RETRY_BACKOFF_SECONDS = 1
 
 
 class AgentRole(Enum):
@@ -140,6 +141,8 @@ class Task:
     last_attempt_at: Optional[datetime] = None
     next_retry_at: Optional[datetime] = None
     retry_count: int = 0
+    # max_retries is the number of retries after the initial execution attempt.
+    # max_retries=0 means no retries are allowed (one total attempt).
     max_retries: int = 0
     result: Any = None
     error: Optional[str] = None
@@ -269,7 +272,6 @@ class BaseAgent(ABC):
             result = self.act(reasoning)
             task.transition_to(TaskStatus.COMPLETED)
             task.result = result
-            task.error = None
             task.completed_at = datetime.now()
             self._update_metrics(task, success=True, start_time=start_time)
             self.completed_tasks.append(task)
@@ -444,8 +446,8 @@ class AgentSystem:
             "failed_tasks": 0,
             "avg_task_duration": 0.0,
         }
-        self._terminal_task_count = 0
-        self._terminal_task_duration_total = 0.0
+        self._completed_task_count = 0
+        self._completed_task_duration_total = 0.0
         logger.info("Initialized Agent System: %s", self.name)
 
     def add_agent(self, agent: BaseAgent) -> bool:
@@ -488,10 +490,13 @@ class AgentSystem:
         self.global_task_queue = [queued for queued in self.global_task_queue if queued.id != task.id]
 
     def _record_terminal_task_outcome(self, task: Task, success: bool) -> None:
-        if task.completed_at and task.last_attempt_at:
-            self._terminal_task_duration_total += (task.completed_at - task.last_attempt_at).total_seconds()
-            self._terminal_task_count += 1
-            self.system_metrics["avg_task_duration"] = self._terminal_task_duration_total / self._terminal_task_count
+        if task.started_at is None and task.last_attempt_at is not None:
+            logger.warning("Task %s missing started_at; falling back to last_attempt_at for duration", task.id)
+        duration_start = task.started_at if task.started_at is not None else task.last_attempt_at
+        if task.completed_at is not None and duration_start is not None:
+            self._completed_task_duration_total += (task.completed_at - duration_start).total_seconds()
+            self._completed_task_count += 1
+            self.system_metrics["avg_task_duration"] = self._completed_task_duration_total / self._completed_task_count
         if success:
             self.system_metrics["successful_tasks"] += 1
         else:
@@ -525,12 +530,16 @@ class AgentSystem:
         try:
             assigned_agent.execute_task(task)
         except Exception:
+            logger.exception("Task %s execution failed on agent %s", task.id, assigned_agent.id)
             if task.retry_count < task.max_retries:
                 task.retry_count += 1
-                task.next_retry_at = datetime.now()
+                backoff_seconds = BASE_RETRY_BACKOFF_SECONDS * max(1, task.retry_count)
+                task.next_retry_at = datetime.now() + timedelta(seconds=backoff_seconds)
+                task.metadata["retry_backoff_seconds"] = backoff_seconds
                 task.transition_to(TaskStatus.PENDING)
                 task.assigned_to = None
                 task.completed_at = None
+                task.error = None
                 return False
 
             self._remove_from_pending_queue(task)
