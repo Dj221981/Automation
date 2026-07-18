@@ -8,6 +8,25 @@ from threading import RLock
 from typing import Any, Dict, List, Optional
 
 
+ALLOWED_TASK_STATUSES = {
+    "PENDING",
+    "ASSIGNED",
+    "RUNNING",
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+}
+
+ALLOWED_TASK_TRANSITIONS = {
+    "PENDING": {"ASSIGNED", "CANCELLED"},
+    "ASSIGNED": {"RUNNING", "PENDING", "CANCELLED"},
+    "RUNNING": {"COMPLETED", "FAILED", "CANCELLED", "PENDING"},
+    "COMPLETED": set(),
+    "FAILED": set(),
+    "CANCELLED": set(),
+}
+
+
 @dataclass
 class StoredTask:
     id: str
@@ -22,6 +41,16 @@ class StoredTask:
     parameters: Dict[str, Any] = field(default_factory=dict)
     dependencies: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.description = self.description.strip()
+        if not self.id.strip():
+            raise ValueError("Task id cannot be empty")
+        if not self.description:
+            raise ValueError("Task description cannot be empty")
+        self.status = normalize_task_status(self.status)
+        if self.completed_at and self.completed_at < self.created_at:
+            raise ValueError("completed_at cannot be earlier than created_at")
 
 
 class TaskStore(ABC):
@@ -44,27 +73,33 @@ class InMemoryTaskStore(TaskStore):
         self._lock = RLock()
 
     def create_task(self, task: StoredTask) -> None:
+        task = _validated_copy(task)
         with self._lock:
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
             self._tasks[task.id] = task
 
     def update_task(self, task: StoredTask) -> None:
+        task = _validated_copy(task)
         with self._lock:
-            if task.id not in self._tasks:
+            existing = self._tasks.get(task.id)
+            if existing is None:
                 raise KeyError(f"Task not found: {task.id}")
+            ensure_valid_transition(existing.status, task.status)
             self._tasks[task.id] = task
 
     def get_task(self, task_id: str) -> Optional[StoredTask]:
         with self._lock:
-            return self._tasks.get(task_id)
+            task = self._tasks.get(task_id)
+            return _validated_copy(task) if task else None
 
     def list_tasks(self, status: Optional[str] = None) -> List[StoredTask]:
+        normalized_status = normalize_task_status(status) if status is not None else None
         with self._lock:
-            values = list(self._tasks.values())
-            if status is None:
-                return values
-            return [t for t in values if t.status == status]
+            values = [_validated_copy(task) for task in self._tasks.values()]
+            if normalized_status is None:
+                return sorted(values, key=lambda t: t.created_at, reverse=True)
+            return sorted([t for t in values if t.status == normalized_status], key=lambda t: t.created_at, reverse=True)
 
 
 class RedisTaskStore(TaskStore):
@@ -94,32 +129,23 @@ class RedisTaskStore(TaskStore):
         return f"{self._prefix}:task:{task_id}"
 
     def _status_key(self, status: str) -> str:
-        return f"{self._prefix}:tasks:status:{status}"
+        return f"{self._prefix}:tasks:status:{normalize_task_status(status)}"
 
     def _all_key(self) -> str:
         return f"{self._prefix}:tasks:all"
 
     @staticmethod
-    def _dt_to_str(value: Optional[datetime]) -> Optional[str]:
-        return value.isoformat() if value else None
-
-    @staticmethod
-    def _str_to_dt(value: Optional[str]) -> Optional[datetime]:
-        if not value:
-            return None
-        return datetime.fromisoformat(value)
-
-    @staticmethod
     def _task_to_hash(task: StoredTask) -> Dict[str, str]:
-        payload = asdict(task)
-        payload["created_at"] = task.created_at.isoformat()
-        payload["completed_at"] = task.completed_at.isoformat() if task.completed_at else ""
-        payload["parameters"] = json.dumps(task.parameters)
-        payload["dependencies"] = json.dumps(task.dependencies)
-        payload["metadata"] = json.dumps(task.metadata)
-        payload["result"] = json.dumps(task.result)
-        payload["assigned_to"] = task.assigned_to or ""
-        payload["error"] = task.error or ""
+        safe_task = _validated_copy(task)
+        payload = asdict(safe_task)
+        payload["created_at"] = safe_task.created_at.isoformat()
+        payload["completed_at"] = safe_task.completed_at.isoformat() if safe_task.completed_at else ""
+        payload["parameters"] = json.dumps(safe_task.parameters)
+        payload["dependencies"] = json.dumps(safe_task.dependencies)
+        payload["metadata"] = json.dumps(safe_task.metadata)
+        payload["result"] = json.dumps(safe_task.result)
+        payload["assigned_to"] = safe_task.assigned_to or ""
+        payload["error"] = safe_task.error or ""
         return {k: str(v) for k, v in payload.items()}
 
     @staticmethod
@@ -140,22 +166,23 @@ class RedisTaskStore(TaskStore):
         )
 
     def create_task(self, task: StoredTask) -> None:
-        key = self._task_key(task.id)
-        status_key = self._status_key(task.status)
+        validated_task = _validated_copy(task)
+        key = self._task_key(validated_task.id)
+        status_key = self._status_key(validated_task.status)
         all_key = self._all_key()
 
-        task_hash = self._task_to_hash(task)
+        task_hash = self._task_to_hash(validated_task)
 
         with self._redis.pipeline(transaction=True) as pipe:
             while True:
                 try:
                     pipe.watch(key)
                     if pipe.exists(key):
-                        raise ValueError(f"Task already exists: {task.id}")
+                        raise ValueError(f"Task already exists: {validated_task.id}")
                     pipe.multi()
                     pipe.hset(key, mapping=task_hash)
-                    pipe.sadd(status_key, task.id)
-                    pipe.sadd(all_key, task.id)
+                    pipe.sadd(status_key, validated_task.id)
+                    pipe.sadd(all_key, validated_task.id)
                     pipe.execute()
                     break
                 except Exception:
@@ -163,7 +190,8 @@ class RedisTaskStore(TaskStore):
                     raise
 
     def update_task(self, task: StoredTask) -> None:
-        key = self._task_key(task.id)
+        validated_task = _validated_copy(task)
+        key = self._task_key(validated_task.id)
 
         with self._redis.pipeline(transaction=True) as pipe:
             while True:
@@ -171,17 +199,18 @@ class RedisTaskStore(TaskStore):
                     pipe.watch(key)
                     existing = pipe.hgetall(key)
                     if not existing:
-                        raise KeyError(f"Task not found: {task.id}")
+                        raise KeyError(f"Task not found: {validated_task.id}")
 
-                    old_status = existing.get("status", "PENDING")
-                    new_status = task.status
+                    old_status = normalize_task_status(existing.get("status", "PENDING"))
+                    new_status = normalize_task_status(validated_task.status)
+                    ensure_valid_transition(old_status, new_status)
 
                     pipe.multi()
-                    pipe.hset(key, mapping=self._task_to_hash(task))
+                    pipe.hset(key, mapping=self._task_to_hash(validated_task))
                     if old_status != new_status:
-                        pipe.srem(self._status_key(old_status), task.id)
-                        pipe.sadd(self._status_key(new_status), task.id)
-                    pipe.sadd(self._all_key(), task.id)
+                        pipe.srem(self._status_key(old_status), validated_task.id)
+                        pipe.sadd(self._status_key(new_status), validated_task.id)
+                    pipe.sadd(self._all_key(), validated_task.id)
                     pipe.execute()
                     break
                 except Exception:
@@ -195,8 +224,9 @@ class RedisTaskStore(TaskStore):
         return self._hash_to_task(data)
 
     def list_tasks(self, status: Optional[str] = None) -> List[StoredTask]:
-        if status:
-            ids = self._redis.smembers(self._status_key(status))
+        normalized_status = normalize_task_status(status) if status else None
+        if normalized_status:
+            ids = self._redis.smembers(self._status_key(normalized_status))
         else:
             ids = self._redis.smembers(self._all_key())
 
@@ -215,3 +245,38 @@ class RedisTaskStore(TaskStore):
 
         tasks.sort(key=lambda t: t.created_at, reverse=True)
         return tasks
+
+
+def normalize_task_status(status: str) -> str:
+    normalized = status.strip().upper()
+    if normalized not in ALLOWED_TASK_STATUSES:
+        raise ValueError(f"Invalid task status: {status}")
+    return normalized
+
+
+def ensure_valid_transition(current_status: str, new_status: str) -> None:
+    current = normalize_task_status(current_status)
+    new = normalize_task_status(new_status)
+    if current == new:
+        return
+    if new not in ALLOWED_TASK_TRANSITIONS[current]:
+        raise ValueError(f"Invalid task transition: {current} -> {new}")
+
+
+def _validated_copy(task: StoredTask) -> StoredTask:
+    if task is None:
+        raise ValueError("Task cannot be None")
+    return StoredTask(
+        id=task.id,
+        description=task.description,
+        priority=task.priority,
+        assigned_to=task.assigned_to,
+        status=task.status,
+        created_at=task.created_at,
+        completed_at=task.completed_at,
+        result=task.result,
+        error=task.error,
+        parameters=dict(task.parameters),
+        dependencies=list(task.dependencies),
+        metadata=dict(task.metadata),
+    )
