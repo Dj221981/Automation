@@ -13,12 +13,18 @@ Features:
     - Distributed task execution
     - Dynamic capability evolution
     - Agent reasoning and decision-making
+    - Task dependency enforcement
+    - Thread-safe shared state management
+    - JSON snapshot persistence for AgentSystem state
+    - Structured observability metrics and logging
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -27,6 +33,79 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Structured metrics helpers
+# ---------------------------------------------------------------------------
+
+class _Counter:
+    """Thread-safe integer counter for structured metrics."""
+
+    def __init__(self) -> None:
+        self._value = 0
+        self._lock = threading.Lock()
+
+    def increment(self, delta: int = 1) -> None:
+        with self._lock:
+            self._value += delta
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
+
+
+class _Timer:
+    """Accumulates duration samples (seconds) for structured metrics."""
+
+    def __init__(self) -> None:
+        self._total = 0.0
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def record(self, elapsed: float) -> None:
+        with self._lock:
+            self._total += elapsed
+            self._count += 1
+
+    @property
+    def avg(self) -> float:
+        with self._lock:
+            return self._total / self._count if self._count else 0.0
+
+    @property
+    def total(self) -> float:
+        with self._lock:
+            return self._total
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+
+class SystemMetrics:
+    """Collects structured counters and timers for an AgentSystem."""
+
+    def __init__(self) -> None:
+        self.tasks_created = _Counter()
+        self.tasks_submitted = _Counter()
+        self.tasks_completed = _Counter()
+        self.tasks_failed = _Counter()
+        self.tasks_dependency_blocked = _Counter()
+        self.task_duration = _Timer()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tasks_created": self.tasks_created.value,
+            "tasks_submitted": self.tasks_submitted.value,
+            "tasks_completed": self.tasks_completed.value,
+            "tasks_failed": self.tasks_failed.value,
+            "tasks_dependency_blocked": self.tasks_dependency_blocked.value,
+            "task_duration_avg_s": round(self.task_duration.avg, 6),
+            "task_duration_total_s": round(self.task_duration.total, 6),
+        }
 
 
 class AgentRole(Enum):
@@ -60,6 +139,18 @@ class TaskStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    DEPENDENCY_BLOCKED = "dependency_blocked"
+
+
+class DependencyError(RuntimeError):
+    """Raised when a task cannot execute because its dependencies are unmet."""
+
+    def __init__(self, task_id: str, unmet: List[str]) -> None:
+        self.task_id = task_id
+        self.unmet_dependencies = unmet
+        super().__init__(
+            f"Task {task_id} cannot execute: unmet dependencies {unmet}"
+        )
 
 
 class TaskPriority(Enum):
@@ -184,6 +275,8 @@ class BaseAgent(ABC):
             "avg_task_time": 0.0,
             "success_rate": 1.0,
         }
+        # Lock protecting active_tasks, completed_tasks, and task_history
+        self._task_lock = threading.Lock()
         logger.info("Initialized %s agent: %s (ID: %s)", self.role.value, self.name, self.id)
 
     @abstractmethod
@@ -214,7 +307,8 @@ class BaseAgent(ABC):
         return list(self.capabilities.keys())
 
     def assign_task(self, task: Task) -> bool:
-        self.active_tasks[task.id] = task
+        with self._task_lock:
+            self.active_tasks[task.id] = task
         task.assigned_to = self.id
         task.status = TaskStatus.ASSIGNED
         self.memory.store_episode(f"task:{task.id}", task)
@@ -222,12 +316,49 @@ class BaseAgent(ABC):
         logger.info("Task %s assigned to agent %s", task.id, self.name)
         return True
 
-    def execute_task(self, task: Task) -> Any:
-        start_time = datetime.now()
+    def execute_task(self, task: Task, completed_task_ids: Optional[Set[str]] = None) -> Any:
+        """Execute a task, enforcing dependency resolution first.
+
+        Parameters
+        ----------
+        task:
+            The task to execute.
+        completed_task_ids:
+            Optional set of task IDs that have already completed successfully.
+            When provided, all entries in ``task.dependencies`` must appear in
+            this set before the task is allowed to run.  When *None* the check
+            is skipped (backward-compatible).
+
+        Raises
+        ------
+        DependencyError
+            If one or more dependency task IDs are not present in
+            ``completed_task_ids``.
+        """
+        # --- Dependency enforcement ---
+        if task.dependencies and completed_task_ids is not None:
+            unmet = [dep for dep in task.dependencies if dep not in completed_task_ids]
+            if unmet:
+                task.status = TaskStatus.DEPENDENCY_BLOCKED
+                task.error = f"Unmet dependencies: {unmet}"
+                logger.warning(
+                    "Task %s blocked by unmet dependencies: %s",
+                    task.id,
+                    unmet,
+                    extra={"task_id": task.id, "unmet_dependencies": unmet},
+                )
+                raise DependencyError(task.id, unmet)
+
+        start_time = time.monotonic()
         self.status = AgentStatus.BUSY
         task.status = TaskStatus.RUNNING
         self._touch()
-        logger.info("Agent %s executing task %s", self.name, task.id)
+        logger.info(
+            "Agent %s executing task %s",
+            self.name,
+            task.id,
+            extra={"agent_id": self.id, "task_id": task.id},
+        )
 
         try:
             reasoning = self.think(task.parameters)
@@ -235,32 +366,50 @@ class BaseAgent(ABC):
             task.status = TaskStatus.COMPLETED
             task.result = result
             task.completed_at = datetime.now()
-            self._update_metrics(task, success=True, start_time=start_time)
-            self.completed_tasks.append(task)
-            self.task_history.append(task)
-            logger.info("Task %s completed successfully", task.id)
+            elapsed = time.monotonic() - start_time
+            self._update_metrics(task, success=True, elapsed=elapsed)
+            with self._task_lock:
+                self.completed_tasks.append(task)
+                self.task_history.append(task)
+            logger.info(
+                "Task %s completed successfully in %.3fs",
+                task.id,
+                elapsed,
+                extra={"agent_id": self.id, "task_id": task.id, "duration_s": elapsed},
+            )
             return result
+        except DependencyError:
+            raise
         except Exception as exc:
             task.status = TaskStatus.FAILED
             task.error = str(exc)
             task.completed_at = datetime.now()
-            self._update_metrics(task, success=False, start_time=start_time)
-            logger.exception("Task %s failed", task.id)
+            elapsed = time.monotonic() - start_time
+            self._update_metrics(task, success=False, elapsed=elapsed)
+            logger.exception(
+                "Task %s failed after %.3fs",
+                task.id,
+                elapsed,
+                extra={"agent_id": self.id, "task_id": task.id, "error": str(exc)},
+            )
             raise
         finally:
-            self.active_tasks.pop(task.id, None)
-            self.status = AgentStatus.IDLE if task.status == TaskStatus.COMPLETED else AgentStatus.ERROR
+            with self._task_lock:
+                self.active_tasks.pop(task.id, None)
+            if task.status not in (TaskStatus.DEPENDENCY_BLOCKED,):
+                self.status = (
+                    AgentStatus.IDLE if task.status == TaskStatus.COMPLETED else AgentStatus.ERROR
+                )
             self._touch()
 
-    def _update_metrics(self, task: Task, success: bool, start_time: datetime) -> None:
-        elapsed = (datetime.now() - start_time).total_seconds()
+    def _update_metrics(self, task: Task, success: bool, elapsed: float) -> None:
         key = "tasks_completed" if success else "tasks_failed"
         self.performance_metrics[key] += 1
         total = self.performance_metrics["tasks_completed"] + self.performance_metrics["tasks_failed"]
         self.performance_metrics["success_rate"] = self.performance_metrics["tasks_completed"] / total if total else 0
-        previous_avg = self.performance_metrics["avg_task_time"]
         completed = self.performance_metrics["tasks_completed"]
         if success and completed:
+            previous_avg = self.performance_metrics["avg_task_time"]
             self.performance_metrics["avg_task_time"] = previous_avg + ((elapsed - previous_avg) / completed)
 
     def get_status(self) -> Dict[str, Any]:
@@ -392,6 +541,52 @@ class LearnerAgent(BaseAgent):
         logger.info("Learner %s learned pattern: %s", self.name, pattern_id)
 
 
+def _task_from_dict(data: Dict[str, Any]) -> Task:
+    """Reconstruct a :class:`Task` from its :meth:`Task.to_dict` representation."""
+    priority_name = data.get("priority", TaskPriority.NORMAL.name)
+    try:
+        priority = TaskPriority[priority_name]
+    except KeyError:
+        priority = TaskPriority.NORMAL
+
+    status_value = data.get("status", TaskStatus.PENDING.value)
+    try:
+        status = TaskStatus(status_value)
+    except ValueError:
+        status = TaskStatus.PENDING
+
+    created_at = datetime.now()
+    raw_created = data.get("created_at")
+    if raw_created:
+        try:
+            created_at = datetime.fromisoformat(raw_created)
+        except ValueError:
+            pass
+
+    completed_at: Optional[datetime] = None
+    raw_completed = data.get("completed_at")
+    if raw_completed:
+        try:
+            completed_at = datetime.fromisoformat(raw_completed)
+        except ValueError:
+            pass
+
+    return Task(
+        id=data.get("id", str(uuid.uuid4())),
+        description=data.get("description", ""),
+        priority=priority,
+        assigned_to=data.get("assigned_to"),
+        status=status,
+        created_at=created_at,
+        completed_at=completed_at,
+        result=data.get("result"),
+        error=data.get("error"),
+        parameters=data.get("parameters", {}),
+        dependencies=data.get("dependencies", []),
+        metadata=data.get("metadata", {}),
+    )
+
+
 class AgentSystem:
     def __init__(self, name: str = "Ai-morphasis"):
         self.name = name
@@ -408,20 +603,30 @@ class AgentSystem:
             "failed_tasks": 0,
             "avg_task_duration": 0.0,
         }
-        logger.info("Initialized Agent System: %s", self.name)
+        # Structured observability counters/timers (thread-safe)
+        self.metrics = SystemMetrics()
+        # Lock protecting global_task_queue, completed_tasks, and system_metrics
+        self._queue_lock = threading.Lock()
+        logger.info("Initialized Agent System: %s (ID: %s)", self.name, self.id)
 
     def add_agent(self, agent: BaseAgent) -> bool:
         self.agents[agent.id] = agent
         self.orchestrator.register_agent(agent)
-        self.system_metrics["total_agents"] += 1
-        logger.info("Agent %s added to system", agent.name)
+        with self._queue_lock:
+            self.system_metrics["total_agents"] += 1
+        logger.info(
+            "Agent %s added to system",
+            agent.name,
+            extra={"system_id": self.id, "agent_id": agent.id},
+        )
         return True
 
     def remove_agent(self, agent_id: str) -> bool:
         if agent_id in self.agents:
             agent = self.agents.pop(agent_id)
             self.orchestrator.managed_agents.pop(agent_id, None)
-            self.system_metrics["total_agents"] -= 1
+            with self._queue_lock:
+                self.system_metrics["total_agents"] -= 1
             logger.info("Agent %s removed from system", agent.name)
             return True
         return False
@@ -429,14 +634,46 @@ class AgentSystem:
     def get_agent(self, agent_id: str) -> Optional[BaseAgent]:
         return self.agents.get(agent_id)
 
-    def create_task(self, description: str, parameters: Dict[str, Any], priority: TaskPriority = TaskPriority.NORMAL) -> Task:
-        task = Task(description=description, parameters=parameters, priority=priority)
-        self.global_task_queue.append(task)
-        self.system_metrics["total_tasks"] += 1
-        logger.info("Task %s created: %s", task.id, description)
+    def create_task(
+        self,
+        description: str,
+        parameters: Dict[str, Any],
+        priority: TaskPriority = TaskPriority.NORMAL,
+        dependencies: Optional[List[str]] = None,
+    ) -> Task:
+        task = Task(
+            description=description,
+            parameters=parameters,
+            priority=priority,
+            dependencies=dependencies or [],
+        )
+        with self._queue_lock:
+            self.global_task_queue.append(task)
+            self.system_metrics["total_tasks"] += 1
+        self.metrics.tasks_created.increment()
+        logger.info(
+            "Task %s created: %s (priority=%s, dependencies=%s, queue_size=%d)",
+            task.id,
+            description,
+            priority.name,
+            task.dependencies,
+            len(self.global_task_queue),
+            extra={
+                "task_id": task.id,
+                "priority": priority.name,
+                "dependencies": task.dependencies,
+            },
+        )
         return task
 
     def submit_task(self, task: Task, agent_id: Optional[str] = None) -> bool:
+        self.metrics.tasks_submitted.increment()
+        logger.info(
+            "Submitting task %s to %s",
+            task.id,
+            agent_id or "orchestrator",
+            extra={"task_id": task.id, "target_agent": agent_id},
+        )
         if agent_id:
             agent = self.get_agent(agent_id)
             if agent:
@@ -446,19 +683,168 @@ class AgentSystem:
         logger.warning("Failed to submit task %s", task.id)
         return False
 
+    def get_completed_task_ids(self) -> Set[str]:
+        """Return the set of task IDs that have completed successfully."""
+        with self._queue_lock:
+            return {t.id for t in self.completed_tasks if t.status == TaskStatus.COMPLETED}
+
+    def record_task_outcome(self, task: Task, elapsed: float) -> None:
+        """Record execution outcome in system-level structures and metrics."""
+        with self._queue_lock:
+            if task.status == TaskStatus.COMPLETED:
+                self.completed_tasks.append(task)
+                self.system_metrics["successful_tasks"] += 1
+                count = self.system_metrics["successful_tasks"]
+                prev = self.system_metrics["avg_task_duration"]
+                self.system_metrics["avg_task_duration"] = prev + (elapsed - prev) / count
+                self.metrics.tasks_completed.increment()
+            elif task.status == TaskStatus.FAILED:
+                self.system_metrics["failed_tasks"] += 1
+                self.metrics.tasks_failed.increment()
+            elif task.status == TaskStatus.DEPENDENCY_BLOCKED:
+                self.metrics.tasks_dependency_blocked.increment()
+        self.metrics.task_duration.record(elapsed)
+        logger.info(
+            "Task %s outcome=%s elapsed=%.3fs queue_size=%d",
+            task.id,
+            task.status.value,
+            elapsed,
+            len(self.global_task_queue),
+            extra={
+                "task_id": task.id,
+                "status": task.status.value,
+                "duration_s": elapsed,
+            },
+        )
+
     def get_system_status(self) -> Dict[str, Any]:
+        with self._queue_lock:
+            queue_size = len(self.global_task_queue)
+            completed_count = len(self.completed_tasks)
+            metrics_snapshot = dict(self.system_metrics)
         return {
             "system_name": self.name,
             "system_id": self.id,
             "created_at": self.created_at.isoformat(),
             "agents": {aid: agent.get_status() for aid, agent in self.agents.items()},
-            "metrics": self.system_metrics,
-            "pending_tasks": len(self.global_task_queue),
-            "completed_tasks": len(self.completed_tasks),
+            "metrics": metrics_snapshot,
+            "structured_metrics": self.metrics.to_dict(),
+            "pending_tasks": queue_size,
+            "completed_tasks": completed_count,
         }
 
     def to_json(self) -> str:
         return json.dumps(self.get_system_status(), indent=2, default=str)
+
+    # ------------------------------------------------------------------
+    # Persistence: JSON snapshot save / load
+    # ------------------------------------------------------------------
+
+    def save_snapshot(self, filepath: str) -> None:
+        """Persist AgentSystem state to a JSON file.
+
+        Saves agents, task queues, metrics, and completed task history in a
+        format that can be restored by :meth:`load_snapshot`.  Enums and
+        datetimes are serialized to their string representations.
+
+        Parameters
+        ----------
+        filepath:
+            Destination file path.  Parent directories are created if missing.
+        """
+        import os
+
+        if not filepath or not isinstance(filepath, str):
+            raise ValueError("filepath must be a non-empty string")
+
+        directory = os.path.dirname(filepath)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        with self._queue_lock:
+            snapshot = {
+                "schema_version": 1,
+                "name": self.name,
+                "id": self.id,
+                "created_at": self.created_at.isoformat(),
+                "system_metrics": dict(self.system_metrics),
+                "structured_metrics": self.metrics.to_dict(),
+                "global_task_queue": [t.to_dict() for t in self.global_task_queue],
+                "completed_tasks": [t.to_dict() for t in self.completed_tasks],
+                "agents": {
+                    aid: agent.get_status() for aid, agent in self.agents.items()
+                },
+            }
+
+        with open(filepath, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, indent=2, default=str)
+
+        logger.info(
+            "AgentSystem snapshot saved to %s",
+            filepath,
+            extra={"system_id": self.id, "filepath": filepath},
+        )
+
+    @classmethod
+    def load_snapshot(cls, filepath: str) -> "AgentSystem":
+        """Restore a lightweight AgentSystem from a JSON snapshot.
+
+        This restores metrics, task history summary, and queue sizes so that
+        operational dashboards and logging are meaningful immediately after
+        restart.  Live agent objects cannot be fully reconstructed from JSON
+        alone; concrete agent instances must be re-registered after loading.
+
+        Missing optional fields in the snapshot are handled gracefully for
+        forward/backward compatibility.
+
+        Parameters
+        ----------
+        filepath:
+            Path to a snapshot file previously created by :meth:`save_snapshot`.
+        """
+        import os
+
+        if not filepath or not isinstance(filepath, str):
+            raise ValueError("filepath must be a non-empty string")
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"snapshot file not found: {filepath}")
+
+        with open(filepath, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        system = cls(name=data.get("name", "Ai-morphasis"))
+        # Restore identity
+        system.id = data.get("id", system.id)
+        created_at_raw = data.get("created_at")
+        if created_at_raw:
+            try:
+                system.created_at = datetime.fromisoformat(created_at_raw)
+            except ValueError:
+                pass  # Keep default if parsing fails
+
+        # Restore legacy system_metrics dict (best-effort, unknown keys ignored)
+        for key, value in data.get("system_metrics", {}).items():
+            if key in system.system_metrics:
+                system.system_metrics[key] = value
+
+        # Restore completed task history as read-only Task objects
+        for task_data in data.get("completed_tasks", []):
+            task = _task_from_dict(task_data)
+            system.completed_tasks.append(task)
+
+        # Restore global task queue items that were pending/assigned
+        for task_data in data.get("global_task_queue", []):
+            task = _task_from_dict(task_data)
+            system.global_task_queue.append(task)
+
+        logger.info(
+            "AgentSystem snapshot loaded from %s (id=%s, completed=%d, queued=%d)",
+            filepath,
+            system.id,
+            len(system.completed_tasks),
+            len(system.global_task_queue),
+        )
+        return system
 
     def __repr__(self) -> str:
         return f"<AgentSystem: {self.name} ({len(self.agents)} agents)>"
