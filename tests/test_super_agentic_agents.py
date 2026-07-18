@@ -89,8 +89,6 @@ def test_recover_incomplete_tasks_resets_running_and_assigned_tasks():
     stored_assigned.status = "RUNNING"
     store.update_task(stored_assigned)
 
-    agent.release_task(task.id)
-
     recovered = system.recover_incomplete_tasks()
     assert recovered == 1
 
@@ -100,6 +98,7 @@ def test_recover_incomplete_tasks_resets_running_and_assigned_tasks():
     assert reloaded.assigned_to is None
     assert reloaded.metadata.get("claimed_by") is None
     assert any(queued.id == task.id for queued in system.global_task_queue)
+    assert agent.active_tasks == {}
 
 
 def test_requeue_task_moves_failed_task_back_to_pending():
@@ -125,3 +124,68 @@ def test_requeue_task_moves_failed_task_back_to_pending():
     assert stored.assigned_to is None
     assert stored.error is None
     assert any(queued.id == task.id for queued in system.global_task_queue)
+
+
+def test_claim_mismatch_blocks_execution():
+    store = InMemoryTaskStore()
+    system = AgentSystem("ClaimSystem", task_store=store)
+    agent_one = ExecutorAgent("Executor-1")
+    agent_two = ExecutorAgent("Executor-2")
+    system.add_agent(agent_one)
+    system.add_agent(agent_two)
+
+    task = system.create_task("Claimed task", {"value": 3})
+    assert system.submit_task(task, agent_one.id) is True
+
+    agent_two.active_tasks[task.id] = task
+
+    try:
+        system.execute_task(task.id, agent_two.id)
+        assert False, "Expected ValueError"
+    except ValueError as exc:
+        assert "claimed by" in str(exc)
+
+
+def test_remove_agent_guards_and_idle_removal():
+    store = InMemoryTaskStore()
+    system = AgentSystem("GuardSystem", task_store=store)
+    busy_agent = ExecutorAgent("BusyExecutor")
+    idle_agent = ExecutorAgent("IdleExecutor")
+    system.add_agent(busy_agent)
+    system.add_agent(idle_agent)
+
+    task = system.create_task("Active task", {"value": 4})
+    assert system.submit_task(task, busy_agent.id) is True
+
+    assert system.remove_agent(system.orchestrator.id) is False
+    assert system.remove_agent(busy_agent.id) is False
+    assert system.remove_agent(idle_agent.id) is True
+
+
+def test_queue_dedup_and_cancel_task():
+    store = InMemoryTaskStore()
+    system = AgentSystem("QueueSystem", task_store=store)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Queue task", {"value": 5})
+    system._enqueue_if_missing(task)
+    assert sum(1 for queued in system.global_task_queue if queued.id == task.id) == 1
+
+    assert system.submit_task(task, agent.id) is True
+    assert sum(1 for queued in system.global_task_queue if queued.id == task.id) == 0
+
+    requeued = system.requeue_task(task.id)
+    system._enqueue_if_missing(requeued)
+    assert sum(1 for queued in system.global_task_queue if queued.id == task.id) == 1
+
+    cancelled = system.cancel_task(task.id, reason="no longer needed")
+    assert cancelled.status == TaskStatus.CANCELLED
+
+    stored = store.get_task(task.id)
+    assert stored is not None
+    assert stored.status == "CANCELLED"
+    assert stored.error == "no longer needed"
+    assert stored.assigned_to is None
+    assert stored.metadata.get("claimed_by") is None
+    assert sum(1 for queued in system.global_task_queue if queued.id == task.id) == 0

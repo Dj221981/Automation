@@ -582,6 +582,27 @@ class AgentSystem:
             self._update_system_metrics(success=False, start_time=start_time)
             raise
 
+    def cancel_task(self, task_id: str, reason: Optional[str] = None) -> Task:
+        task = self.load_task(task_id)
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}")
+        if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
+            raise ValueError(f"Task {task_id} in status {task.status.value} cannot be cancelled")
+
+        original_assigned_to = task.assigned_to
+        self._release_task_from_agent(task.id, original_assigned_to)
+        self._set_task_status(
+            task,
+            TaskStatus.CANCELLED,
+            assigned_to=None,
+            claimed_by=None,
+            result=None,
+            error=reason,
+            completed_at=datetime.now(),
+        )
+        self._dequeue_task(task.id)
+        return task
+
     def load_task(self, task_id: str) -> Optional[Task]:
         active_task = self._find_active_task(task_id)
         if active_task is not None:
@@ -603,21 +624,14 @@ class AgentSystem:
         for status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
             for task in self.list_persisted_tasks(status):
                 active_task = self._find_active_task(task.id)
-                if active_task is not None:
-                    active_task.result = None
-                    active_task.error = None
-                    active_task.completed_at = None
-                    self._set_task_status(active_task, TaskStatus.PENDING, assigned_to=None, claimed_by=None)
-                    agent = self.get_agent(active_task.assigned_to or "")
-                    if agent:
-                        agent.release_task(active_task.id)
-                    task = active_task
-                else:
-                    task.result = None
-                    task.error = None
-                    task.completed_at = None
-                    self._set_task_status(task, TaskStatus.PENDING, assigned_to=None, claimed_by=None)
-                self._enqueue_if_missing(task)
+                working_task = active_task or task
+                original_assigned_to = working_task.assigned_to
+                self._release_task_from_agent(working_task.id, original_assigned_to)
+                working_task.result = None
+                working_task.error = None
+                working_task.completed_at = None
+                self._set_task_status(working_task, TaskStatus.PENDING, assigned_to=None, claimed_by=None)
+                self._enqueue_if_missing(working_task)
                 recovered += 1
 
         logger.info("Recovered %s incomplete tasks", recovered)
@@ -631,11 +645,8 @@ class AgentSystem:
             raise ValueError(f"Task {task_id} in status {task.status.value} cannot be requeued")
 
         original_assigned_to = task.assigned_to
+        self._release_task_from_agent(task.id, original_assigned_to)
         self._set_task_status(task, TaskStatus.PENDING, assigned_to=None, claimed_by=None, result=None, error=None, completed_at=None)
-        if original_assigned_to:
-            agent = self.get_agent(original_assigned_to)
-            if agent:
-                agent.release_task(task.id)
         self._enqueue_if_missing(task)
         return task
 
@@ -726,6 +737,13 @@ class AgentSystem:
             if task is not None:
                 return task
         return None
+
+    def _release_task_from_agent(self, task_id: str, agent_id: Optional[str]) -> None:
+        if not agent_id:
+            return
+        agent = self.get_agent(agent_id)
+        if agent is not None:
+            agent.release_task(task_id)
 
     def _enqueue_if_missing(self, task: Task) -> None:
         if not any(existing.id == task.id for existing in self.global_task_queue):
