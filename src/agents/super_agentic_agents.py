@@ -21,6 +21,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -84,6 +85,8 @@ ALLOWED_TASK_TRANSITIONS: Dict[TaskStatus, Set[TaskStatus]] = {
     TaskStatus.COMPLETED: set(),
     TaskStatus.CANCELLED: set(),
 }
+
+MAX_BACKOFF_EXPONENT = 16
 
 
 @dataclass(slots=True)
@@ -171,12 +174,12 @@ class Task:
     def __post_init__(self) -> None:
         if not self.description.strip():
             raise ValueError("Task description cannot be empty")
-        self.parameters = dict(self.parameters) if isinstance(self.parameters, dict) else {}
+        self.parameters = deepcopy(self.parameters) if isinstance(self.parameters, dict) else {}
         if isinstance(self.dependencies, (list, tuple, set)):
-            self.dependencies = list(self.dependencies)
+            self.dependencies = deepcopy(list(self.dependencies))
         else:
             self.dependencies = []
-        self.metadata = dict(self.metadata) if isinstance(self.metadata, dict) else {}
+        self.metadata = deepcopy(self.metadata) if isinstance(self.metadata, dict) else {}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -288,6 +291,11 @@ class BaseAgent(ABC):
         timeout_seconds: Optional[float] = None,
         heartbeat: Optional[Callable[[], None]] = None,
     ) -> Any:
+        """Execute a task and record outcome.
+
+        Timeout handling is deterministic and post-execution: long-running work is
+        marked failed if elapsed time exceeds timeout_seconds.
+        """
         with self._lock:
             if task.id not in self.active_tasks:
                 raise ValueError(f"Task {task.id} must be assigned before execution")
@@ -307,6 +315,9 @@ class BaseAgent(ABC):
                 heartbeat()
             result = self.act(reasoning)
             elapsed = (datetime.now() - start_time).total_seconds()
+            # This is intentionally post-execution enforcement: deterministic timeout-failure marking
+            # without requiring signal/thread interruption machinery. It does not preempt
+            # long-running work, but it guarantees consistent terminal timeout state.
             if timeout_seconds is not None and elapsed > timeout_seconds:
                 raise TimeoutError(
                     f"Task {task.id} exceeded timeout ({elapsed:.3f}s > {timeout_seconds:.3f}s)"
@@ -521,15 +532,18 @@ class AgentSystem:
         execution_timeout_seconds: Optional[float] = None,
         persistence_retry_attempts: int = 3,
         persistence_retry_backoff_seconds: float = 0.05,
+        max_persistence_backoff_seconds: float = 1.0,
     ):
         if not name.strip():
             raise ValueError("System name cannot be empty")
         if default_lease_seconds <= 0:
-            raise ValueError("default_lease_seconds must be greater than 0")
+            raise ValueError("default_lease_seconds must be > 0")
         if persistence_retry_attempts <= 0:
-            raise ValueError("persistence_retry_attempts must be greater than 0")
+            raise ValueError("persistence_retry_attempts must be > 0")
         if persistence_retry_backoff_seconds < 0:
             raise ValueError("persistence_retry_backoff_seconds must be >= 0")
+        if max_persistence_backoff_seconds <= 0:
+            raise ValueError("max_persistence_backoff_seconds must be > 0")
 
         self.name = name
         self.id = str(uuid.uuid4())
@@ -540,6 +554,7 @@ class AgentSystem:
         self.execution_timeout_seconds = execution_timeout_seconds
         self.persistence_retry_attempts = persistence_retry_attempts
         self.persistence_retry_backoff_seconds = persistence_retry_backoff_seconds
+        self.max_persistence_backoff_seconds = max_persistence_backoff_seconds
         self.orchestrator = OrchestratorAgent(f"{name}-Orchestrator")
         self.agents: Dict[str, BaseAgent] = {self.orchestrator.id: self.orchestrator}
         self.global_task_queue: List[Task] = []
@@ -605,7 +620,7 @@ class AgentSystem:
             persisted = self.load_task(task.id)
             if persisted is not None:
                 task = persisted
-            if task.status == TaskStatus.ASSIGNED and task.assigned_to == agent_id and agent_id:
+            if task.status == TaskStatus.ASSIGNED and task.assigned_to == agent_id:
                 agent = self.agents.get(agent_id)
                 if agent and not agent.has_active_task(task.id):
                     agent.assign_task(task)
@@ -652,6 +667,7 @@ class AgentSystem:
                     raise ValueError(
                         f"Task {task.id} is assigned to {persisted_task.assigned_to}, not {agent_id}"
                     )
+                # Keep active in-memory task synchronized with persisted claim/lease metadata.
                 task.metadata = dict(persisted_task.metadata)
                 task.assigned_to = persisted_task.assigned_to
                 task.status = persisted_task.status
@@ -825,19 +841,17 @@ class AgentSystem:
         )
 
     def _store_task(self, task: Task) -> None:
-        last_error: Optional[Exception] = None
         for attempt in range(1, self.persistence_retry_attempts + 1):
             try:
                 self.task_store.create_task(self._to_stored_task(task))
                 return
             except ValueError:
                 raise
-            except Exception as exc:  # pragma: no cover - defensive for store backends
-                last_error = exc
+            except Exception as exc:  # pragma: no cover - defensive for transient backend failures
                 if attempt == self.persistence_retry_attempts:
                     logger.exception("task_store_create_failed task_id=%s attempts=%s", task.id, attempt)
                     raise
-                backoff = self.persistence_retry_backoff_seconds * (2 ** (attempt - 1))
+                backoff = self._calculate_persistence_backoff(attempt)
                 logger.warning(
                     "task_store_create_retry task_id=%s attempt=%s max_attempts=%s backoff_seconds=%.3f error=%s",
                     task.id,
@@ -847,8 +861,6 @@ class AgentSystem:
                     exc,
                 )
                 sleep(backoff)
-        if last_error is not None:
-            raise last_error
 
     def _update_task_record(self, task: Task) -> None:
         for attempt in range(1, self.persistence_retry_attempts + 1):
@@ -857,7 +869,7 @@ class AgentSystem:
                 return
             except (KeyError, ValueError):
                 raise
-            except Exception as exc:
+            except Exception as exc:  # pragma: no cover - defensive for transient backend failures
                 if attempt == self.persistence_retry_attempts:
                     logger.exception(
                         "task_store_update_failed task_id=%s assigned_to=%s status=%s attempts=%s",
@@ -867,7 +879,7 @@ class AgentSystem:
                         attempt,
                     )
                     raise
-                backoff = self.persistence_retry_backoff_seconds * (2 ** (attempt - 1))
+                backoff = self._calculate_persistence_backoff(attempt)
                 logger.warning(
                     "task_store_update_retry task_id=%s status=%s attempt=%s max_attempts=%s backoff_seconds=%.3f error=%s",
                     task.id,
@@ -985,7 +997,7 @@ class AgentSystem:
         elapsed = (datetime.now() - start_time).total_seconds()
         key = "successful_tasks" if success else "failed_tasks"
         self.system_metrics[key] += 1
-        completed = max(self.system_metrics["successful_tasks"], 0)
+        completed = self.system_metrics["successful_tasks"]
         previous_avg = self.system_metrics["avg_task_duration"]
         if success and completed:
             self.system_metrics["avg_task_duration"] = previous_avg + ((elapsed - previous_avg) / completed)
@@ -1000,6 +1012,13 @@ class AgentSystem:
             logger.warning("invalid_task_timeout task_id=%s timeout=%s", task.id, metadata_timeout)
             return self.execution_timeout_seconds
         return timeout if timeout > 0 else self.execution_timeout_seconds
+
+    def _calculate_persistence_backoff(self, attempt: int) -> float:
+        bounded_exponent = min(max(attempt - 1, 0), MAX_BACKOFF_EXPONENT)
+        return min(
+            self.persistence_retry_backoff_seconds * (2**bounded_exponent),
+            self.max_persistence_backoff_seconds,
+        )
 
     def _validate_task_transition(self, task_id: str, current: TaskStatus, new: TaskStatus) -> None:
         if current == new:

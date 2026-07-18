@@ -13,7 +13,7 @@ class FailingExecutorAgent(ExecutorAgent):
 
 class SlowExecutorAgent(ExecutorAgent):
     def act(self, decision):
-        time.sleep(0.02)
+        time.sleep(0.05)
         return super().act(decision)
 
 
@@ -186,6 +186,9 @@ def test_claim_mismatch_blocks_execution():
 
     task = system.create_task("Claimed task", {"value": 3})
     assert system.submit_task(task, agent_one.id) is True
+    stored = store.get_task(task.id)
+    assert stored is not None
+    assert stored.assigned_to == agent_one.id
 
     agent_two.active_tasks[task.id] = task
 
