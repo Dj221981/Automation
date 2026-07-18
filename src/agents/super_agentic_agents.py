@@ -83,6 +83,14 @@ class AgentCapability:
     requires_resources: List[str] = field(default_factory=list)
     version: str = "1.0.0"
 
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("Capability name cannot be empty")
+        if not self.description.strip():
+            raise ValueError("Capability description cannot be empty")
+        if not 0.0 <= self.confidence_score <= 1.0:
+            raise ValueError("Capability confidence_score must be between 0.0 and 1.0")
+
     def __repr__(self) -> str:
         return f"<Capability: {self.name} v{self.version} ({self.confidence_score:.2%})>"
 
@@ -142,6 +150,10 @@ class Task:
     dependencies: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not self.description.strip():
+            raise ValueError("Task description cannot be empty")
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -151,11 +163,11 @@ class Task:
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
-            "result": self.result,
+            "result": _make_json_safe(self.result),
             "error": self.error,
-            "parameters": self.parameters,
-            "dependencies": self.dependencies,
-            "metadata": self.metadata,
+            "parameters": _make_json_safe(self.parameters),
+            "dependencies": list(self.dependencies),
+            "metadata": _make_json_safe(self.metadata),
         }
 
 
@@ -163,6 +175,11 @@ class BaseAgent(ABC):
     """Abstract base class for all agents."""
 
     def __init__(self, name: str, role: AgentRole = AgentRole.EXECUTOR, max_capabilities: int = 50):
+        if not name.strip():
+            raise ValueError("Agent name cannot be empty")
+        if max_capabilities <= 0:
+            raise ValueError("max_capabilities must be greater than 0")
+
         self.id = str(uuid.uuid4())
         self.name = name
         self.role = role
@@ -174,6 +191,7 @@ class BaseAgent(ABC):
         self.memory = AgentMemory(agent_id=self.id)
         self.active_tasks: Dict[str, Task] = {}
         self.completed_tasks: List[Task] = []
+        self.failed_tasks: List[Task] = []
         self.task_history: List[Task] = []
         self.parent_agent: Optional[str] = None
         self.child_agents: Set[str] = set()
@@ -198,6 +216,9 @@ class BaseAgent(ABC):
         self.last_activity = datetime.now()
 
     def register_capability(self, capability: AgentCapability) -> bool:
+        if capability.name in self.capabilities:
+            logger.warning("Capability '%s' already registered for %s", capability.name, self.name)
+            return False
         if len(self.capabilities) >= self.max_capabilities:
             logger.warning("Agent %s has reached max capabilities limit", self.name)
             return False
@@ -214,6 +235,16 @@ class BaseAgent(ABC):
         return list(self.capabilities.keys())
 
     def assign_task(self, task: Task) -> bool:
+        if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
+            logger.warning("Task %s is not assignable because it is in status %s", task.id, task.status.value)
+            return False
+        if task.id in self.active_tasks:
+            logger.warning("Task %s is already active on agent %s", task.id, self.name)
+            return False
+        if task.assigned_to and task.assigned_to != self.id:
+            logger.warning("Task %s is already assigned to another agent", task.id)
+            return False
+
         self.active_tasks[task.id] = task
         task.assigned_to = self.id
         task.status = TaskStatus.ASSIGNED
@@ -223,6 +254,9 @@ class BaseAgent(ABC):
         return True
 
     def execute_task(self, task: Task) -> Any:
+        if task.id not in self.active_tasks:
+            raise ValueError(f"Task {task.id} must be assigned before execution")
+
         start_time = datetime.now()
         self.status = AgentStatus.BUSY
         task.status = TaskStatus.RUNNING
@@ -235,7 +269,7 @@ class BaseAgent(ABC):
             task.status = TaskStatus.COMPLETED
             task.result = result
             task.completed_at = datetime.now()
-            self._update_metrics(task, success=True, start_time=start_time)
+            self._update_metrics(success=True, start_time=start_time)
             self.completed_tasks.append(task)
             self.task_history.append(task)
             logger.info("Task %s completed successfully", task.id)
@@ -244,15 +278,25 @@ class BaseAgent(ABC):
             task.status = TaskStatus.FAILED
             task.error = str(exc)
             task.completed_at = datetime.now()
-            self._update_metrics(task, success=False, start_time=start_time)
+            self._update_metrics(success=False, start_time=start_time)
+            self.failed_tasks.append(task)
+            self.task_history.append(task)
             logger.exception("Task %s failed", task.id)
             raise
         finally:
             self.active_tasks.pop(task.id, None)
             self.status = AgentStatus.IDLE if task.status == TaskStatus.COMPLETED else AgentStatus.ERROR
+            self.memory.store_episode(f"task:{task.id}", task)
             self._touch()
 
-    def _update_metrics(self, task: Task, success: bool, start_time: datetime) -> None:
+    def reset_status(self) -> None:
+        if self.active_tasks:
+            raise RuntimeError(f"Cannot reset agent {self.name} while tasks are active")
+        self.status = AgentStatus.IDLE
+        self._touch()
+        logger.info("Agent %s status reset to idle", self.name)
+
+    def _update_metrics(self, success: bool, start_time: datetime) -> None:
         elapsed = (datetime.now() - start_time).total_seconds()
         key = "tasks_completed" if success else "tasks_failed"
         self.performance_metrics[key] += 1
@@ -272,7 +316,8 @@ class BaseAgent(ABC):
             "capabilities": self.list_capabilities(),
             "active_tasks": len(self.active_tasks),
             "completed_tasks": len(self.completed_tasks),
-            "performance": self.performance_metrics,
+            "failed_tasks": len(self.failed_tasks),
+            "performance": _make_json_safe(self.performance_metrics),
             "created_at": self.created_at.isoformat(),
             "last_activity": self.last_activity.isoformat(),
         }
@@ -295,6 +340,9 @@ class OrchestratorAgent(BaseAgent):
         return {"status": "orchestration_complete"}
 
     def register_agent(self, agent: BaseAgent) -> bool:
+        if agent.id in self.managed_agents:
+            logger.warning("Agent %s is already registered under orchestrator %s", agent.name, self.name)
+            return False
         self.managed_agents[agent.id] = agent
         agent.parent_agent = self.id
         self._touch()
@@ -302,6 +350,9 @@ class OrchestratorAgent(BaseAgent):
         return True
 
     def distribute_task(self, task: Task, target_agent_id: Optional[str] = None) -> bool:
+        if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
+            logger.warning("Task %s cannot be distributed in status %s", task.id, task.status.value)
+            return False
         if target_agent_id and target_agent_id in self.managed_agents:
             return self.managed_agents[target_agent_id].assign_task(task)
         best_agent = self._select_best_agent(task)
@@ -311,14 +362,20 @@ class OrchestratorAgent(BaseAgent):
         return False
 
     def _select_best_agent(self, task: Task) -> Optional[BaseAgent]:
-        available_agents = [a for a in self.managed_agents.values() if a.status != AgentStatus.SUSPENDED]
+        available_agents = [a for a in self.managed_agents.values() if a.status not in {AgentStatus.SUSPENDED, AgentStatus.BUSY}]
         if not available_agents:
             return None
 
-        def score(agent: BaseAgent) -> tuple[int, int, float]:
+        task_description = task.description.lower()
+
+        def score(agent: BaseAgent) -> tuple[int, int, int]:
             capability_match = 0
             for capability in agent.capabilities.values():
-                if task.description.lower().find(capability.name.lower()) != -1:
+                capability_name = capability.name.lower()
+                capability_description = capability.description.lower()
+                if capability_name in task_description or task_description in capability_name:
+                    capability_match += 3
+                elif any(token and token in task_description for token in capability_description.split()):
                     capability_match += 1
             return (capability_match, -len(agent.active_tasks), int(agent.performance_metrics["success_rate"] * 100))
 
@@ -345,10 +402,10 @@ class ExecutorAgent(BaseAgent):
         params = decision.get("parameters", {})
         self.execution_history.append({
             "timestamp": datetime.now().isoformat(),
-            "decision": decision,
+            "decision": _make_json_safe(decision),
             "result": "executed",
         })
-        return {"execution": "successful", "parameters_processed": params}
+        return {"execution": "successful", "parameters_processed": _make_json_safe(params)}
 
 
 class AnalyzerAgent(BaseAgent):
@@ -360,7 +417,7 @@ class AnalyzerAgent(BaseAgent):
         return {"data_received": bool(input_data), "analysis_type": "comprehensive", "insights_generated": True}
 
     def act(self, decision: Dict[str, Any]) -> Any:
-        return {"analysis_complete": True, "insights": decision, "timestamp": datetime.now().isoformat()}
+        return {"analysis_complete": True, "insights": _make_json_safe(decision), "timestamp": datetime.now().isoformat()}
 
 
 class LearnerAgent(BaseAgent):
@@ -375,15 +432,15 @@ class LearnerAgent(BaseAgent):
     def act(self, decision: Dict[str, Any]) -> Any:
         self.learning_history.append({
             "timestamp": datetime.now().isoformat(),
-            "decision": decision,
+            "decision": _make_json_safe(decision),
             "patterns_learned": len(self.learned_patterns),
         })
-        return {"learning": "in_progress", "patterns": self.learned_patterns}
+        return {"learning": "in_progress", "patterns": _make_json_safe(self.learned_patterns)}
 
     def learn_from_experience(self, experience: Dict[str, Any]) -> None:
         pattern_id = str(uuid.uuid4())
         self.learned_patterns[pattern_id] = {
-            "experience": experience,
+            "experience": _make_json_safe(experience),
             "learned_at": datetime.now().isoformat(),
             "confidence": 0.5,
         }
@@ -394,6 +451,9 @@ class LearnerAgent(BaseAgent):
 
 class AgentSystem:
     def __init__(self, name: str = "Ai-morphasis"):
+        if not name.strip():
+            raise ValueError("System name cannot be empty")
+
         self.name = name
         self.id = str(uuid.uuid4())
         self.created_at = datetime.now()
@@ -401,6 +461,7 @@ class AgentSystem:
         self.agents: Dict[str, BaseAgent] = {self.orchestrator.id: self.orchestrator}
         self.global_task_queue: List[Task] = []
         self.completed_tasks: List[Task] = []
+        self.failed_tasks: List[Task] = []
         self.system_metrics = {
             "total_agents": 1,
             "total_tasks": 0,
@@ -411,15 +472,27 @@ class AgentSystem:
         logger.info("Initialized Agent System: %s", self.name)
 
     def add_agent(self, agent: BaseAgent) -> bool:
+        if agent.id in self.agents:
+            logger.warning("Agent %s is already present in system", agent.name)
+            return False
         self.agents[agent.id] = agent
-        self.orchestrator.register_agent(agent)
+        if not self.orchestrator.register_agent(agent):
+            self.agents.pop(agent.id, None)
+            return False
         self.system_metrics["total_agents"] += 1
         logger.info("Agent %s added to system", agent.name)
         return True
 
     def remove_agent(self, agent_id: str) -> bool:
+        if agent_id == self.orchestrator.id:
+            logger.warning("Cannot remove the orchestrator agent from the system")
+            return False
         if agent_id in self.agents:
-            agent = self.agents.pop(agent_id)
+            agent = self.agents[agent_id]
+            if agent.active_tasks:
+                logger.warning("Cannot remove agent %s while it has active tasks", agent.name)
+                return False
+            self.agents.pop(agent_id)
             self.orchestrator.managed_agents.pop(agent_id, None)
             self.system_metrics["total_agents"] -= 1
             logger.info("Agent %s removed from system", agent.name)
@@ -437,14 +510,53 @@ class AgentSystem:
         return task
 
     def submit_task(self, task: Task, agent_id: Optional[str] = None) -> bool:
+        if task.status != TaskStatus.PENDING:
+            logger.warning("Failed to submit task %s because it is in status %s", task.id, task.status.value)
+            return False
+
+        assigned = False
         if agent_id:
             agent = self.get_agent(agent_id)
             if agent:
-                return agent.assign_task(task)
+                assigned = agent.assign_task(task)
         else:
-            return self.orchestrator.distribute_task(task)
+            assigned = self.orchestrator.distribute_task(task)
+
+        if assigned:
+            self.global_task_queue = [queued_task for queued_task in self.global_task_queue if queued_task.id != task.id]
+            logger.info("Task %s submitted successfully", task.id)
+            return True
+
         logger.warning("Failed to submit task %s", task.id)
         return False
+
+    def execute_task(self, task_id: str, agent_id: str) -> Any:
+        agent = self.get_agent(agent_id)
+        if not agent:
+            raise KeyError(f"Agent not found: {agent_id}")
+        task = agent.active_tasks.get(task_id)
+        if not task:
+            raise KeyError(f"Task {task_id} is not assigned to agent {agent_id}")
+
+        start_time = datetime.now()
+        try:
+            result = agent.execute_task(task)
+            self.completed_tasks.append(task)
+            self._update_system_metrics(success=True, start_time=start_time)
+            return result
+        except Exception:
+            self.failed_tasks.append(task)
+            self._update_system_metrics(success=False, start_time=start_time)
+            raise
+
+    def _update_system_metrics(self, success: bool, start_time: datetime) -> None:
+        elapsed = (datetime.now() - start_time).total_seconds()
+        key = "successful_tasks" if success else "failed_tasks"
+        self.system_metrics[key] += 1
+        completed = self.system_metrics["successful_tasks"]
+        previous_avg = self.system_metrics["avg_task_duration"]
+        if success and completed:
+            self.system_metrics["avg_task_duration"] = previous_avg + ((elapsed - previous_avg) / completed)
 
     def get_system_status(self) -> Dict[str, Any]:
         return {
@@ -452,9 +564,10 @@ class AgentSystem:
             "system_id": self.id,
             "created_at": self.created_at.isoformat(),
             "agents": {aid: agent.get_status() for aid, agent in self.agents.items()},
-            "metrics": self.system_metrics,
+            "metrics": _make_json_safe(self.system_metrics),
             "pending_tasks": len(self.global_task_queue),
             "completed_tasks": len(self.completed_tasks),
+            "failed_tasks": len(self.failed_tasks),
         }
 
     def to_json(self) -> str:
@@ -484,12 +597,30 @@ class AgentFactory:
     def create_team(cls, team_config: Dict[str, int]) -> AgentSystem:
         system = AgentSystem("Ai-morphasis-Team")
         for agent_type, count in team_config.items():
+            if count < 0:
+                raise ValueError(f"Agent count cannot be negative for type: {agent_type}")
             for i in range(count):
                 agent = cls.create_agent(agent_type, f"{agent_type.title()}-{i + 1}")
                 if agent:
                     system.add_agent(agent)
         logger.info("Agent team created with config: %s", team_config)
         return system
+
+
+def _make_json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {str(key): _make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_make_json_safe(item) for item in value]
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return repr(value)
 
 
 def example_usage() -> None:
@@ -524,6 +655,7 @@ def example_usage() -> None:
     )
 
     system.submit_task(task1, executor.id)
+    system.execute_task(task1.id, executor.id)
 
     print("\n" + "=" * 60)
     print("AGENT SYSTEM STATUS")
