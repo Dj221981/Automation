@@ -26,6 +26,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from .task_store import InMemoryTaskStore, StoredTask, TaskStore
+
 logger = logging.getLogger(__name__)
 
 
@@ -450,13 +452,14 @@ class LearnerAgent(BaseAgent):
 
 
 class AgentSystem:
-    def __init__(self, name: str = "Ai-morphasis"):
+    def __init__(self, name: str = "Ai-morphasis", task_store: Optional[TaskStore] = None):
         if not name.strip():
             raise ValueError("System name cannot be empty")
 
         self.name = name
         self.id = str(uuid.uuid4())
         self.created_at = datetime.now()
+        self.task_store = task_store or InMemoryTaskStore()
         self.orchestrator = OrchestratorAgent(f"{name}-Orchestrator")
         self.agents: Dict[str, BaseAgent] = {self.orchestrator.id: self.orchestrator}
         self.global_task_queue: List[Task] = []
@@ -506,10 +509,15 @@ class AgentSystem:
         task = Task(description=description, parameters=parameters, priority=priority)
         self.global_task_queue.append(task)
         self.system_metrics["total_tasks"] += 1
+        self._store_task(task)
         logger.info("Task %s created: %s", task.id, description)
         return task
 
     def submit_task(self, task: Task, agent_id: Optional[str] = None) -> bool:
+        persisted = self.load_task(task.id)
+        if persisted is not None:
+            task = persisted
+
         if task.status != TaskStatus.PENDING:
             logger.warning("Failed to submit task %s because it is in status %s", task.id, task.status.value)
             return False
@@ -523,6 +531,7 @@ class AgentSystem:
             assigned = self.orchestrator.distribute_task(task)
 
         if assigned:
+            self._set_task_status(task, TaskStatus.ASSIGNED, assigned_to=task.assigned_to)
             self.global_task_queue = [queued_task for queued_task in self.global_task_queue if queued_task.id != task.id]
             logger.info("Task %s submitted successfully", task.id)
             return True
@@ -538,16 +547,120 @@ class AgentSystem:
         if not task:
             raise KeyError(f"Task {task_id} is not assigned to agent {agent_id}")
 
+        self._set_task_status(task, TaskStatus.RUNNING, assigned_to=agent_id)
+
         start_time = datetime.now()
         try:
             result = agent.execute_task(task)
+            self._set_task_status(
+                task,
+                TaskStatus.COMPLETED,
+                assigned_to=agent_id,
+                result=result,
+                error=None,
+                completed_at=task.completed_at or datetime.now(),
+            )
             self.completed_tasks.append(task)
             self._update_system_metrics(success=True, start_time=start_time)
             return result
-        except Exception:
+        except Exception as exc:
+            self._set_task_status(
+                task,
+                TaskStatus.FAILED,
+                assigned_to=agent_id,
+                result=task.result,
+                error=str(exc),
+                completed_at=task.completed_at or datetime.now(),
+            )
             self.failed_tasks.append(task)
             self._update_system_metrics(success=False, start_time=start_time)
             raise
+
+    def load_task(self, task_id: str) -> Optional[Task]:
+        stored_task = self.task_store.get_task(task_id)
+        if stored_task is None:
+            return None
+        return self._from_stored_task(stored_task)
+
+    def list_persisted_tasks(self, status: Optional[TaskStatus] = None) -> List[Task]:
+        stored_tasks = self.task_store.list_tasks(status.name if status else None)
+        return [self._from_stored_task(task) for task in stored_tasks]
+
+    def recover_incomplete_tasks(self, reset_to: TaskStatus = TaskStatus.PENDING) -> int:
+        if reset_to != TaskStatus.PENDING:
+            raise ValueError("Only reset_to=TaskStatus.PENDING is supported for recovery")
+
+        recovered = 0
+        existing_ids = {task.id for task in self.global_task_queue}
+        for status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
+            for task in self.list_persisted_tasks(status):
+                task.assigned_to = None
+                task.result = None
+                task.error = None
+                task.completed_at = None
+                self._set_task_status(task, TaskStatus.PENDING, assigned_to=None)
+                if task.id not in existing_ids:
+                    self.global_task_queue.append(task)
+                    existing_ids.add(task.id)
+                recovered += 1
+
+        logger.info("Recovered %s incomplete tasks", recovered)
+        return recovered
+
+    def _to_stored_task(self, task: Task) -> StoredTask:
+        return StoredTask(
+            id=task.id,
+            description=task.description,
+            priority=task.priority.name,
+            assigned_to=task.assigned_to,
+            status=task.status.name,
+            created_at=task.created_at,
+            completed_at=task.completed_at,
+            result=_make_json_safe(task.result),
+            error=task.error,
+            parameters=_make_json_safe(task.parameters),
+            dependencies=list(task.dependencies),
+            metadata=_make_json_safe(task.metadata),
+        )
+
+    def _from_stored_task(self, stored_task: StoredTask) -> Task:
+        return Task(
+            id=stored_task.id,
+            description=stored_task.description,
+            priority=TaskPriority[stored_task.priority],
+            assigned_to=stored_task.assigned_to,
+            status=TaskStatus[stored_task.status],
+            created_at=stored_task.created_at,
+            completed_at=stored_task.completed_at,
+            result=stored_task.result,
+            error=stored_task.error,
+            parameters=dict(stored_task.parameters),
+            dependencies=list(stored_task.dependencies),
+            metadata=dict(stored_task.metadata),
+        )
+
+    def _store_task(self, task: Task) -> None:
+        self.task_store.create_task(self._to_stored_task(task))
+
+    def _update_task_record(self, task: Task) -> None:
+        self.task_store.update_task(self._to_stored_task(task))
+
+    def _set_task_status(
+        self,
+        task: Task,
+        status: TaskStatus,
+        *,
+        assigned_to: Optional[str] = None,
+        result: Any = None,
+        error: Optional[str] = None,
+        completed_at: Optional[datetime] = None,
+    ) -> None:
+        task.status = status
+        task.assigned_to = assigned_to
+        task.result = result
+        task.error = error
+        task.completed_at = completed_at
+        self._update_task_record(task)
 
     def _update_system_metrics(self, success: bool, start_time: datetime) -> None:
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -594,8 +707,8 @@ class AgentFactory:
         return None
 
     @classmethod
-    def create_team(cls, team_config: Dict[str, int]) -> AgentSystem:
-        system = AgentSystem("Ai-morphasis-Team")
+    def create_team(cls, team_config: Dict[str, int], task_store: Optional[TaskStore] = None) -> AgentSystem:
+        system = AgentSystem("Ai-morphasis-Team", task_store=task_store)
         for agent_type, count in team_config.items():
             if count < 0:
                 raise ValueError(f"Agent count cannot be negative for type: {agent_type}")
