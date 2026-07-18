@@ -255,41 +255,43 @@ class BaseAgent(ABC):
         logger.info("Task %s assigned to agent %s", task.id, self.name)
         return True
 
-    def execute_task(self, task: Task) -> Any:
+    def run_task(self, task: Task) -> Any:
         if task.id not in self.active_tasks:
             raise ValueError(f"Task {task.id} must be assigned before execution")
+        if task.assigned_to != self.id:
+            raise ValueError(f"Task {task.id} is assigned to {task.assigned_to}, not {self.id}")
 
         start_time = datetime.now()
         self.status = AgentStatus.BUSY
-        task.status = TaskStatus.RUNNING
         self._touch()
-        logger.info("Agent %s executing task %s", self.name, task.id)
+        logger.info("Agent %s running task %s", self.name, task.id)
 
         try:
             reasoning = self.think(task.parameters)
             result = self.act(reasoning)
-            task.status = TaskStatus.COMPLETED
-            task.result = result
-            task.completed_at = datetime.now()
-            self._update_metrics(success=True, start_time=start_time)
-            self.completed_tasks.append(task)
-            self.task_history.append(task)
+            self._record_task_outcome(task, success=True, start_time=start_time)
             logger.info("Task %s completed successfully", task.id)
             return result
-        except Exception as exc:
-            task.status = TaskStatus.FAILED
-            task.error = str(exc)
-            task.completed_at = datetime.now()
-            self._update_metrics(success=False, start_time=start_time)
-            self.failed_tasks.append(task)
-            self.task_history.append(task)
+        except Exception:
+            self._record_task_outcome(task, success=False, start_time=start_time)
             logger.exception("Task %s failed", task.id)
             raise
-        finally:
-            self.active_tasks.pop(task.id, None)
-            self.status = AgentStatus.IDLE if task.status == TaskStatus.COMPLETED else AgentStatus.ERROR
-            self.memory.store_episode(f"task:{task.id}", task)
-            self._touch()
+
+    def _record_task_outcome(self, task: Task, success: bool, start_time: datetime) -> None:
+        self._update_metrics(success=success, start_time=start_time)
+        target_collection = self.completed_tasks if success else self.failed_tasks
+        if all(existing.id != task.id for existing in target_collection):
+            target_collection.append(task)
+        if all(existing.id != task.id for existing in self.task_history):
+            self.task_history.append(task)
+        self.active_tasks.pop(task.id, None)
+        self.status = AgentStatus.IDLE if success else AgentStatus.ERROR
+        self.memory.store_episode(f"task:{task.id}", task)
+        self._touch()
+
+    def release_task(self, task_id: str) -> None:
+        self.active_tasks.pop(task_id, None)
+        self._touch()
 
     def reset_status(self) -> None:
         if self.active_tasks:
@@ -507,7 +509,8 @@ class AgentSystem:
 
     def create_task(self, description: str, parameters: Dict[str, Any], priority: TaskPriority = TaskPriority.NORMAL) -> Task:
         task = Task(description=description, parameters=parameters, priority=priority)
-        self.global_task_queue.append(task)
+        self._set_claim(task, None)
+        self._enqueue_if_missing(task)
         self.system_metrics["total_tasks"] += 1
         self._store_task(task)
         logger.info("Task %s created: %s", task.id, description)
@@ -531,8 +534,8 @@ class AgentSystem:
             assigned = self.orchestrator.distribute_task(task)
 
         if assigned:
-            self._set_task_status(task, TaskStatus.ASSIGNED, assigned_to=task.assigned_to)
-            self.global_task_queue = [queued_task for queued_task in self.global_task_queue if queued_task.id != task.id]
+            self._set_task_status(task, TaskStatus.ASSIGNED, assigned_to=task.assigned_to, claimed_by=task.assigned_to)
+            self._dequeue_task(task.id)
             logger.info("Task %s submitted successfully", task.id)
             return True
 
@@ -547,20 +550,22 @@ class AgentSystem:
         if not task:
             raise KeyError(f"Task {task_id} is not assigned to agent {agent_id}")
 
-        self._set_task_status(task, TaskStatus.RUNNING, assigned_to=agent_id)
+        self._ensure_claimed_by(task, agent_id)
+        self._set_task_status(task, TaskStatus.RUNNING, assigned_to=agent_id, claimed_by=agent_id)
 
         start_time = datetime.now()
         try:
-            result = agent.execute_task(task)
+            result = agent.run_task(task)
             self._set_task_status(
                 task,
                 TaskStatus.COMPLETED,
                 assigned_to=agent_id,
+                claimed_by=agent_id,
                 result=result,
                 error=None,
-                completed_at=task.completed_at or datetime.now(),
+                completed_at=datetime.now(),
             )
-            self.completed_tasks.append(task)
+            self._append_unique_task(self.completed_tasks, task)
             self._update_system_metrics(success=True, start_time=start_time)
             return result
         except Exception as exc:
@@ -568,15 +573,19 @@ class AgentSystem:
                 task,
                 TaskStatus.FAILED,
                 assigned_to=agent_id,
+                claimed_by=agent_id,
                 result=task.result,
                 error=str(exc),
-                completed_at=task.completed_at or datetime.now(),
+                completed_at=datetime.now(),
             )
-            self.failed_tasks.append(task)
+            self._append_unique_task(self.failed_tasks, task)
             self._update_system_metrics(success=False, start_time=start_time)
             raise
 
     def load_task(self, task_id: str) -> Optional[Task]:
+        active_task = self._find_active_task(task_id)
+        if active_task is not None:
+            return active_task
         stored_task = self.task_store.get_task(task_id)
         if stored_task is None:
             return None
@@ -591,21 +600,44 @@ class AgentSystem:
             raise ValueError("Only reset_to=TaskStatus.PENDING is supported for recovery")
 
         recovered = 0
-        existing_ids = {task.id for task in self.global_task_queue}
         for status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
             for task in self.list_persisted_tasks(status):
-                task.assigned_to = None
-                task.result = None
-                task.error = None
-                task.completed_at = None
-                self._set_task_status(task, TaskStatus.PENDING, assigned_to=None)
-                if task.id not in existing_ids:
-                    self.global_task_queue.append(task)
-                    existing_ids.add(task.id)
+                active_task = self._find_active_task(task.id)
+                if active_task is not None:
+                    active_task.result = None
+                    active_task.error = None
+                    active_task.completed_at = None
+                    self._set_task_status(active_task, TaskStatus.PENDING, assigned_to=None, claimed_by=None)
+                    agent = self.get_agent(active_task.assigned_to or "")
+                    if agent:
+                        agent.release_task(active_task.id)
+                    task = active_task
+                else:
+                    task.result = None
+                    task.error = None
+                    task.completed_at = None
+                    self._set_task_status(task, TaskStatus.PENDING, assigned_to=None, claimed_by=None)
+                self._enqueue_if_missing(task)
                 recovered += 1
 
         logger.info("Recovered %s incomplete tasks", recovered)
         return recovered
+
+    def requeue_task(self, task_id: str) -> Task:
+        task = self.load_task(task_id)
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}")
+        if not self._is_recoverable_status(task.status):
+            raise ValueError(f"Task {task_id} in status {task.status.value} cannot be requeued")
+
+        original_assigned_to = task.assigned_to
+        self._set_task_status(task, TaskStatus.PENDING, assigned_to=None, claimed_by=None, result=None, error=None, completed_at=None)
+        if original_assigned_to:
+            agent = self.get_agent(original_assigned_to)
+            if agent:
+                agent.release_task(task.id)
+        self._enqueue_if_missing(task)
+        return task
 
     def _to_stored_task(self, task: Task) -> StoredTask:
         return StoredTask(
@@ -643,7 +675,16 @@ class AgentSystem:
         self.task_store.create_task(self._to_stored_task(task))
 
     def _update_task_record(self, task: Task) -> None:
-        self.task_store.update_task(self._to_stored_task(task))
+        try:
+            self.task_store.update_task(self._to_stored_task(task))
+        except Exception:
+            logger.exception(
+                "Failed to persist task update for task_id=%s assigned_to=%s status=%s",
+                task.id,
+                task.assigned_to,
+                task.status.name,
+            )
+            raise
 
     def _set_task_status(
         self,
@@ -651,6 +692,7 @@ class AgentSystem:
         status: TaskStatus,
         *,
         assigned_to: Optional[str] = None,
+        claimed_by: Optional[str] = None,
         result: Any = None,
         error: Optional[str] = None,
         completed_at: Optional[datetime] = None,
@@ -660,7 +702,41 @@ class AgentSystem:
         task.result = result
         task.error = error
         task.completed_at = completed_at
+        self._set_claim(task, claimed_by)
         self._update_task_record(task)
+
+    def _set_claim(self, task: Task, claimed_by: Optional[str]) -> None:
+        task.metadata = dict(task.metadata)
+        if claimed_by is None:
+            task.metadata.pop("claimed_by", None)
+        else:
+            task.metadata["claimed_by"] = claimed_by
+
+    def _ensure_claimed_by(self, task: Task, agent_id: str) -> None:
+        claimed_by = task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None
+        if claimed_by and claimed_by != agent_id:
+            raise ValueError(f"Task {task.id} is claimed by {claimed_by}, not {agent_id}")
+
+    def _is_recoverable_status(self, status: TaskStatus) -> bool:
+        return status in {TaskStatus.ASSIGNED, TaskStatus.RUNNING, TaskStatus.FAILED}
+
+    def _find_active_task(self, task_id: str) -> Optional[Task]:
+        for agent in self.agents.values():
+            task = agent.active_tasks.get(task_id)
+            if task is not None:
+                return task
+        return None
+
+    def _enqueue_if_missing(self, task: Task) -> None:
+        if not any(existing.id == task.id for existing in self.global_task_queue):
+            self.global_task_queue.append(task)
+
+    def _dequeue_task(self, task_id: str) -> None:
+        self.global_task_queue = [queued_task for queued_task in self.global_task_queue if queued_task.id != task_id]
+
+    def _append_unique_task(self, collection: List[Task], task: Task) -> None:
+        if not any(existing.id == task.id for existing in collection):
+            collection.append(task)
 
     def _update_system_metrics(self, success: bool, start_time: datetime) -> None:
         elapsed = (datetime.now() - start_time).total_seconds()
