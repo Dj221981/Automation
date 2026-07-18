@@ -19,6 +19,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -450,7 +451,12 @@ class AgentLearningModel:
 
 
 class ExperienceReplay:
-    """Experience replay buffer for storing and sampling DQN experiences."""
+    """Experience replay buffer for storing and sampling DQN experiences.
+
+    Thread-safe: ``add``, ``sample``, and ``__len__`` are protected by an
+    internal :class:`threading.Lock` so the buffer can be safely shared
+    across threads without external synchronisation.
+    """
 
     def __init__(self, state_size: int, max_size: int = 100000, seed: Optional[int] = None):
         if state_size <= 0:
@@ -463,6 +469,7 @@ class ExperienceReplay:
         self.buffer: List[Tuple[np.ndarray, int, float, np.ndarray, bool]] = []
         self.position = 0
         self.rng = np.random.default_rng(seed)
+        self._lock = threading.Lock()
 
     def add(
         self,
@@ -501,12 +508,12 @@ class ExperienceReplay:
             bool(done),
         )
 
-        if len(self.buffer) < self.max_size:
-            self.buffer.append(experience)
-        else:
-            self.buffer[self.position] = experience
-
-        self.position = (self.position + 1) % self.max_size
+        with self._lock:
+            if len(self.buffer) < self.max_size:
+                self.buffer.append(experience)
+            else:
+                self.buffer[self.position] = experience
+            self.position = (self.position + 1) % self.max_size
 
     def sample(
         self, batch_size: int
@@ -514,12 +521,13 @@ class ExperienceReplay:
         """Sample a batch of experiences from the replay buffer."""
         if batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
-        if not self.buffer:
-            raise ValueError("cannot sample from an empty replay buffer")
 
-        actual_batch_size = min(batch_size, len(self.buffer))
-        indices = self.rng.choice(len(self.buffer), actual_batch_size, replace=False)
-        experiences = [self.buffer[index] for index in indices]
+        with self._lock:
+            if not self.buffer:
+                raise ValueError("cannot sample from an empty replay buffer")
+            actual_batch_size = min(batch_size, len(self.buffer))
+            indices = self.rng.choice(len(self.buffer), actual_batch_size, replace=False)
+            experiences = [self.buffer[index] for index in indices]
 
         states = np.stack([experience[0] for experience in experiences]).astype(np.float32)
         actions = np.asarray([experience[1] for experience in experiences], dtype=np.int32)
@@ -531,7 +539,8 @@ class ExperienceReplay:
 
     def __len__(self) -> int:
         """Return the current replay buffer size."""
-        return len(self.buffer)
+        with self._lock:
+            return len(self.buffer)
 
 
 if __name__ == "__main__":
