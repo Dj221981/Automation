@@ -1,3 +1,7 @@
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
 from src.agents.super_agentic_agents import AgentSystem, ExecutorAgent, TaskPriority, TaskStatus
 from src.agents.task_store import InMemoryTaskStore, StoredTask
 
@@ -5,6 +9,12 @@ from src.agents.task_store import InMemoryTaskStore, StoredTask
 class FailingExecutorAgent(ExecutorAgent):
     def act(self, decision):
         raise RuntimeError("boom")
+
+
+class SlowExecutorAgent(ExecutorAgent):
+    def act(self, decision):
+        time.sleep(0.05)
+        return super().act(decision)
 
 
 def test_inmemory_task_store_returns_defensive_copies():
@@ -87,6 +97,7 @@ def test_recover_incomplete_tasks_resets_running_and_assigned_tasks():
     stored_assigned = store.get_task(task.id)
     assert stored_assigned is not None
     stored_assigned.status = "RUNNING"
+    stored_assigned.metadata["lease_expires_at"] = (datetime.now() - timedelta(seconds=1)).isoformat()
     store.update_task(stored_assigned)
 
     recovered = system.recover_incomplete_tasks()
@@ -126,6 +137,45 @@ def test_requeue_task_moves_failed_task_back_to_pending():
     assert any(queued.id == task.id for queued in system.global_task_queue)
 
 
+def test_submit_task_is_idempotent_for_same_agent():
+    store = InMemoryTaskStore()
+    system = AgentSystem("IdempotentSubmit", task_store=store)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Idempotent submit", {"value": 9})
+    assert system.submit_task(task, agent.id) is True
+    assert system.submit_task(task, agent.id) is True
+
+    assert sum(1 for queued in system.global_task_queue if queued.id == task.id) == 0
+    assert sum(1 for active_id in agent.active_tasks if active_id == task.id) == 1
+
+
+def test_concurrent_submit_task_allows_single_assignment():
+    store = InMemoryTaskStore()
+    system = AgentSystem("ConcurrentSubmit", task_store=store)
+    agent_one = ExecutorAgent("Executor-1")
+    agent_two = ExecutorAgent("Executor-2")
+    system.add_agent(agent_one)
+    system.add_agent(agent_two)
+
+    task = system.create_task("Concurrent submit", {"value": 11})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda aid: system.submit_task(task, aid),
+                [agent_one.id, agent_two.id],
+            )
+        )
+
+    assert sum(1 for outcome in results if outcome) == 1
+    persisted = store.get_task(task.id)
+    assert persisted is not None
+    assert persisted.status == "ASSIGNED"
+    assert persisted.assigned_to in {agent_one.id, agent_two.id}
+
+
 def test_claim_mismatch_blocks_execution():
     store = InMemoryTaskStore()
     system = AgentSystem("ClaimSystem", task_store=store)
@@ -136,6 +186,9 @@ def test_claim_mismatch_blocks_execution():
 
     task = system.create_task("Claimed task", {"value": 3})
     assert system.submit_task(task, agent_one.id) is True
+    stored = store.get_task(task.id)
+    assert stored is not None
+    assert stored.assigned_to == agent_one.id
 
     agent_two.active_tasks[task.id] = task
 
@@ -143,7 +196,120 @@ def test_claim_mismatch_blocks_execution():
         system.execute_task(task.id, agent_two.id)
         assert False, "Expected ValueError"
     except ValueError as exc:
-        assert "claimed by" in str(exc)
+        assert "assigned to" in str(exc)
+
+
+def test_lease_metadata_heartbeat_and_requeue_behavior():
+    store = InMemoryTaskStore()
+    system = AgentSystem("LeaseSystem", task_store=store, default_lease_seconds=60)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Leased task", {"value": 3})
+    assert system.submit_task(task, agent.id) is True
+
+    assigned = store.get_task(task.id)
+    assert assigned is not None
+    assert assigned.metadata.get("claimed_by") == agent.id
+    assert assigned.metadata.get("claimed_at")
+    assert assigned.metadata.get("heartbeat_at")
+    assert assigned.metadata.get("lease_expires_at")
+
+    try:
+        system.requeue_task(task.id)
+        assert False, "Expected active lease protection"
+    except ValueError as exc:
+        assert "active lease" in str(exc)
+
+    loaded = system.load_task(task.id)
+    assert loaded is not None
+    loaded.metadata["lease_expires_at"] = (datetime.now() - timedelta(seconds=1)).isoformat()
+    system._update_task_record(loaded)
+
+    requeued = system.requeue_task(task.id)
+    assert requeued.status == TaskStatus.PENDING
+
+
+def test_cancel_rejects_completed_task():
+    store = InMemoryTaskStore()
+    system = AgentSystem("CancelValidation", task_store=store)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Complete then cancel", {"value": 7})
+    assert system.submit_task(task, agent.id) is True
+    system.execute_task(task.id, agent.id)
+
+    try:
+        system.cancel_task(task.id, reason="too late")
+        assert False, "Expected ValueError"
+    except ValueError as exc:
+        assert "cannot be cancelled" in str(exc)
+
+
+def test_timeout_marks_task_failed_in_persistence():
+    store = InMemoryTaskStore()
+    system = AgentSystem("TimeoutSystem", task_store=store, execution_timeout_seconds=0.001)
+    agent = SlowExecutorAgent("SlowExecutor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Slow task", {"value": 13})
+    assert system.submit_task(task, agent.id) is True
+
+    try:
+        system.execute_task(task.id, agent.id)
+        assert False, "Expected TimeoutError"
+    except TimeoutError as exc:
+        assert "exceeded timeout" in str(exc)
+
+    persisted = store.get_task(task.id)
+    assert persisted is not None
+    assert persisted.status == "FAILED"
+    assert persisted.error is not None
+    assert "exceeded timeout" in persisted.error
+
+
+def test_recover_incomplete_tasks_respects_active_leases():
+    store = InMemoryTaskStore()
+    system = AgentSystem("RecoverLeases", task_store=store, default_lease_seconds=120)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Recover lease", {"value": 5})
+    assert system.submit_task(task, agent.id) is True
+
+    skipped = system.recover_incomplete_tasks()
+    assert skipped == 0
+
+    loaded = system.load_task(task.id)
+    assert loaded is not None
+    loaded.metadata["lease_expires_at"] = (datetime.now() - timedelta(seconds=1)).isoformat()
+    system._update_task_record(loaded)
+
+    recovered = system.recover_incomplete_tasks()
+    assert recovered == 1
+    persisted = store.get_task(task.id)
+    assert persisted is not None
+    assert persisted.status == "PENDING"
+
+
+def test_invalid_transition_is_rejected():
+    store = InMemoryTaskStore()
+    system = AgentSystem("TransitionSystem", task_store=store)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Transition validation", {"value": 17})
+    assert system.submit_task(task, agent.id) is True
+    system.execute_task(task.id, agent.id)
+
+    completed = system.load_task(task.id)
+    assert completed is not None
+    try:
+        system._set_task_status(completed, TaskStatus.RUNNING, assigned_to=agent.id, claimed_by=agent.id)
+        assert False, "Expected invalid transition rejection"
+    except ValueError as exc:
+        assert "Invalid task transition" in str(exc)
 
 
 def test_remove_agent_guards_and_idle_removal():
@@ -174,6 +340,11 @@ def test_queue_dedup_and_cancel_task():
 
     assert system.submit_task(task, agent.id) is True
     assert sum(1 for queued in system.global_task_queue if queued.id == task.id) == 0
+
+    loaded = system.load_task(task.id)
+    assert loaded is not None
+    loaded.metadata["lease_expires_at"] = (datetime.now() - timedelta(seconds=1)).isoformat()
+    system._update_task_record(loaded)
 
     requeued = system.requeue_task(task.id)
     system._enqueue_if_missing(requeued)

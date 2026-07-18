@@ -21,9 +21,12 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
+from threading import RLock
+from time import sleep
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from .task_store import InMemoryTaskStore, StoredTask, TaskStore
@@ -74,6 +77,18 @@ class TaskPriority(Enum):
     DEFERRED = 1
 
 
+ALLOWED_TASK_TRANSITIONS: Dict[TaskStatus, Set[TaskStatus]] = {
+    TaskStatus.PENDING: {TaskStatus.ASSIGNED, TaskStatus.CANCELLED},
+    TaskStatus.ASSIGNED: {TaskStatus.RUNNING, TaskStatus.PENDING, TaskStatus.CANCELLED},
+    TaskStatus.RUNNING: {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.PENDING},
+    TaskStatus.FAILED: {TaskStatus.PENDING},
+    TaskStatus.COMPLETED: set(),
+    TaskStatus.CANCELLED: set(),
+}
+
+MAX_BACKOFF_EXPONENT = 16
+
+
 @dataclass(slots=True)
 class AgentCapability:
     """Represents a capability an agent can perform."""
@@ -108,31 +123,35 @@ class AgentMemory:
     created_at: datetime = field(default_factory=datetime.now)
     last_accessed: datetime = field(default_factory=datetime.now)
     max_episodes: int = 1000
+    _lock: RLock = field(default_factory=RLock, repr=False)
 
     def store_episode(self, key: str, value: Any) -> None:
-        if len(self.episodic_memory) >= self.max_episodes:
-            oldest_key = next(iter(self.episodic_memory))
-            del self.episodic_memory[oldest_key]
-        self.episodic_memory[key] = {"value": value, "timestamp": datetime.now()}
-        self.last_accessed = datetime.now()
+        with self._lock:
+            if len(self.episodic_memory) >= self.max_episodes:
+                oldest_key = next(iter(self.episodic_memory))
+                del self.episodic_memory[oldest_key]
+            self.episodic_memory[key] = {"value": value, "timestamp": datetime.now()}
+            self.last_accessed = datetime.now()
 
     def store_semantic(self, key: str, value: Any) -> None:
-        self.semantic_memory[key] = {
-            "value": value,
-            "timestamp": datetime.now(),
-            "access_count": 0,
-        }
-        self.last_accessed = datetime.now()
+        with self._lock:
+            self.semantic_memory[key] = {
+                "value": value,
+                "timestamp": datetime.now(),
+                "access_count": 0,
+            }
+            self.last_accessed = datetime.now()
 
     def retrieve(self, key: str, memory_type: str = "auto") -> Optional[Any]:
-        if memory_type in ("auto", "episodic") and key in self.episodic_memory:
-            self.last_accessed = datetime.now()
-            return self.episodic_memory[key]["value"]
-        if memory_type in ("auto", "semantic") and key in self.semantic_memory:
-            self.semantic_memory[key]["access_count"] += 1
-            self.last_accessed = datetime.now()
-            return self.semantic_memory[key]["value"]
-        return None
+        with self._lock:
+            if memory_type in ("auto", "episodic") and key in self.episodic_memory:
+                self.last_accessed = datetime.now()
+                return self.episodic_memory[key]["value"]
+            if memory_type in ("auto", "semantic") and key in self.semantic_memory:
+                self.semantic_memory[key]["access_count"] += 1
+                self.last_accessed = datetime.now()
+                return self.semantic_memory[key]["value"]
+            return None
 
 
 @dataclass(slots=True)
@@ -155,6 +174,12 @@ class Task:
     def __post_init__(self) -> None:
         if not self.description.strip():
             raise ValueError("Task description cannot be empty")
+        self.parameters = deepcopy(self.parameters) if isinstance(self.parameters, dict) else {}
+        if isinstance(self.dependencies, (list, tuple, set)):
+            self.dependencies = deepcopy(list(self.dependencies))
+        else:
+            self.dependencies = []
+        self.metadata = deepcopy(self.metadata) if isinstance(self.metadata, dict) else {}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -188,6 +213,7 @@ class BaseAgent(ABC):
         self.status = AgentStatus.IDLE
         self.created_at = datetime.now()
         self.last_activity = datetime.now()
+        self._lock = RLock()
         self.capabilities: Dict[str, AgentCapability] = {}
         self.max_capabilities = max_capabilities
         self.memory = AgentMemory(agent_id=self.id)
@@ -218,57 +244,84 @@ class BaseAgent(ABC):
         self.last_activity = datetime.now()
 
     def register_capability(self, capability: AgentCapability) -> bool:
-        if capability.name in self.capabilities:
-            logger.warning("Capability '%s' already registered for %s", capability.name, self.name)
-            return False
-        if len(self.capabilities) >= self.max_capabilities:
-            logger.warning("Agent %s has reached max capabilities limit", self.name)
-            return False
-        self.capabilities[capability.name] = capability
-        self.memory.store_semantic(f"capability:{capability.name}", capability)
-        self._touch()
-        logger.info("Capability '%s' registered for %s", capability.name, self.name)
-        return True
+        with self._lock:
+            if capability.name in self.capabilities:
+                logger.warning("Capability '%s' already registered for %s", capability.name, self.name)
+                return False
+            if len(self.capabilities) >= self.max_capabilities:
+                logger.warning("Agent %s has reached max capabilities limit", self.name)
+                return False
+            self.capabilities[capability.name] = capability
+            self.memory.store_semantic(f"capability:{capability.name}", capability)
+            self._touch()
+            logger.info("Capability '%s' registered for %s", capability.name, self.name)
+            return True
 
     def get_capability(self, name: str) -> Optional[AgentCapability]:
-        return self.capabilities.get(name)
+        with self._lock:
+            return self.capabilities.get(name)
 
     def list_capabilities(self) -> List[str]:
-        return list(self.capabilities.keys())
+        with self._lock:
+            return list(self.capabilities.keys())
 
     def assign_task(self, task: Task) -> bool:
-        if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
-            logger.warning("Task %s is not assignable because it is in status %s", task.id, task.status.value)
-            return False
-        if task.id in self.active_tasks:
-            logger.warning("Task %s is already active on agent %s", task.id, self.name)
-            return False
-        if task.assigned_to and task.assigned_to != self.id:
-            logger.warning("Task %s is already assigned to another agent", task.id)
-            return False
+        with self._lock:
+            if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
+                logger.warning("Task %s is not assignable because it is in status %s", task.id, task.status.value)
+                return False
+            if task.id in self.active_tasks:
+                logger.warning("Task %s is already active on agent %s", task.id, self.name)
+                return False
+            if task.assigned_to and task.assigned_to != self.id:
+                logger.warning("Task %s is already assigned to another agent", task.id)
+                return False
 
-        self.active_tasks[task.id] = task
-        task.assigned_to = self.id
-        task.status = TaskStatus.ASSIGNED
-        self.memory.store_episode(f"task:{task.id}", task)
-        self._touch()
-        logger.info("Task %s assigned to agent %s", task.id, self.name)
-        return True
+            self.active_tasks[task.id] = task
+            task.assigned_to = self.id
+            task.status = TaskStatus.ASSIGNED
+            self.memory.store_episode(f"task:{task.id}", task)
+            self._touch()
+            logger.info("Task %s assigned to agent %s", task.id, self.name)
+            return True
 
-    def run_task(self, task: Task) -> Any:
-        if task.id not in self.active_tasks:
-            raise ValueError(f"Task {task.id} must be assigned before execution")
-        if task.assigned_to != self.id:
-            raise ValueError(f"Task {task.id} is assigned to {task.assigned_to}, not {self.id}")
+    def run_task(
+        self,
+        task: Task,
+        timeout_seconds: Optional[float] = None,
+        heartbeat: Optional[Callable[[], None]] = None,
+    ) -> Any:
+        """Execute a task and record outcome.
 
+        Timeout handling is deterministic and post-execution: long-running work is
+        marked failed if elapsed time exceeds timeout_seconds.
+        """
+        with self._lock:
+            if task.id not in self.active_tasks:
+                raise ValueError(f"Task {task.id} must be assigned before execution")
+            if task.assigned_to != self.id:
+                raise ValueError(f"Task {task.id} is assigned to {task.assigned_to}, not {self.id}")
         start_time = datetime.now()
-        self.status = AgentStatus.BUSY
-        self._touch()
+        with self._lock:
+            self.status = AgentStatus.BUSY
+            self._touch()
         logger.info("Agent %s running task %s", self.name, task.id)
 
         try:
+            if heartbeat is not None:
+                heartbeat()
             reasoning = self.think(task.parameters)
+            if heartbeat is not None:
+                heartbeat()
             result = self.act(reasoning)
+            elapsed = (datetime.now() - start_time).total_seconds()
+            # This is intentionally post-execution enforcement: deterministic timeout-failure marking
+            # without requiring signal/thread interruption machinery. It does not preempt
+            # long-running work, but it guarantees consistent terminal timeout state.
+            if timeout_seconds is not None and elapsed > timeout_seconds:
+                raise TimeoutError(
+                    f"Task {task.id} exceeded timeout ({elapsed:.3f}s > {timeout_seconds:.3f}s)"
+                )
             self._record_task_outcome(task, success=True, start_time=start_time)
             logger.info("Task %s completed successfully", task.id)
             return result
@@ -278,27 +331,38 @@ class BaseAgent(ABC):
             raise
 
     def _record_task_outcome(self, task: Task, success: bool, start_time: datetime) -> None:
-        self._update_metrics(success=success, start_time=start_time)
-        target_collection = self.completed_tasks if success else self.failed_tasks
-        if all(existing.id != task.id for existing in target_collection):
-            target_collection.append(task)
-        if all(existing.id != task.id for existing in self.task_history):
-            self.task_history.append(task)
-        self.active_tasks.pop(task.id, None)
-        self.status = AgentStatus.IDLE if success else AgentStatus.ERROR
-        self.memory.store_episode(f"task:{task.id}", task)
-        self._touch()
+        with self._lock:
+            self._update_metrics(success=success, start_time=start_time)
+            target_collection = self.completed_tasks if success else self.failed_tasks
+            if all(existing.id != task.id for existing in target_collection):
+                target_collection.append(task)
+            if all(existing.id != task.id for existing in self.task_history):
+                self.task_history.append(task)
+            self.active_tasks.pop(task.id, None)
+            self.status = AgentStatus.IDLE if success else AgentStatus.ERROR
+            self.memory.store_episode(f"task:{task.id}", task)
+            self._touch()
 
     def release_task(self, task_id: str) -> None:
-        self.active_tasks.pop(task_id, None)
-        self._touch()
+        with self._lock:
+            self.active_tasks.pop(task_id, None)
+            self._touch()
+
+    def get_active_task(self, task_id: str) -> Optional[Task]:
+        with self._lock:
+            return self.active_tasks.get(task_id)
+
+    def has_active_task(self, task_id: str) -> bool:
+        with self._lock:
+            return task_id in self.active_tasks
 
     def reset_status(self) -> None:
-        if self.active_tasks:
-            raise RuntimeError(f"Cannot reset agent {self.name} while tasks are active")
-        self.status = AgentStatus.IDLE
-        self._touch()
-        logger.info("Agent %s status reset to idle", self.name)
+        with self._lock:
+            if self.active_tasks:
+                raise RuntimeError(f"Cannot reset agent {self.name} while tasks are active")
+            self.status = AgentStatus.IDLE
+            self._touch()
+            logger.info("Agent %s status reset to idle", self.name)
 
     def _update_metrics(self, success: bool, start_time: datetime) -> None:
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -312,19 +376,20 @@ class BaseAgent(ABC):
             self.performance_metrics["avg_task_time"] = previous_avg + ((elapsed - previous_avg) / completed)
 
     def get_status(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.name,
-            "role": self.role.name,
-            "status": self.status.name,
-            "capabilities": self.list_capabilities(),
-            "active_tasks": len(self.active_tasks),
-            "completed_tasks": len(self.completed_tasks),
-            "failed_tasks": len(self.failed_tasks),
-            "performance": _make_json_safe(self.performance_metrics),
-            "created_at": self.created_at.isoformat(),
-            "last_activity": self.last_activity.isoformat(),
-        }
+        with self._lock:
+            return {
+                "id": self.id,
+                "name": self.name,
+                "role": self.role.name,
+                "status": self.status.name,
+                "capabilities": list(self.capabilities.keys()),
+                "active_tasks": len(self.active_tasks),
+                "completed_tasks": len(self.completed_tasks),
+                "failed_tasks": len(self.failed_tasks),
+                "performance": _make_json_safe(self.performance_metrics),
+                "created_at": self.created_at.isoformat(),
+                "last_activity": self.last_activity.isoformat(),
+            }
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}: {self.name} ({self.role.value})>"
@@ -344,54 +409,58 @@ class OrchestratorAgent(BaseAgent):
         return {"status": "orchestration_complete"}
 
     def register_agent(self, agent: BaseAgent) -> bool:
-        if agent.id in self.managed_agents:
-            logger.warning("Agent %s is already registered under orchestrator %s", agent.name, self.name)
-            return False
-        self.managed_agents[agent.id] = agent
-        agent.parent_agent = self.id
-        self._touch()
-        logger.info("Agent %s registered under orchestrator %s", agent.name, self.name)
-        return True
+        with self._lock:
+            if agent.id in self.managed_agents:
+                logger.warning("Agent %s is already registered under orchestrator %s", agent.name, self.name)
+                return False
+            self.managed_agents[agent.id] = agent
+            agent.parent_agent = self.id
+            self._touch()
+            logger.info("Agent %s registered under orchestrator %s", agent.name, self.name)
+            return True
 
     def distribute_task(self, task: Task, target_agent_id: Optional[str] = None) -> bool:
-        if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
-            logger.warning("Task %s cannot be distributed in status %s", task.id, task.status.value)
+        with self._lock:
+            if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
+                logger.warning("Task %s cannot be distributed in status %s", task.id, task.status.value)
+                return False
+            if target_agent_id and target_agent_id in self.managed_agents:
+                return self.managed_agents[target_agent_id].assign_task(task)
+            best_agent = self._select_best_agent(task)
+            if best_agent:
+                return best_agent.assign_task(task)
+            logger.warning("No suitable agent found for task %s", task.id)
             return False
-        if target_agent_id and target_agent_id in self.managed_agents:
-            return self.managed_agents[target_agent_id].assign_task(task)
-        best_agent = self._select_best_agent(task)
-        if best_agent:
-            return best_agent.assign_task(task)
-        logger.warning("No suitable agent found for task %s", task.id)
-        return False
 
     def _select_best_agent(self, task: Task) -> Optional[BaseAgent]:
-        available_agents = [a for a in self.managed_agents.values() if a.status not in {AgentStatus.SUSPENDED, AgentStatus.BUSY}]
-        if not available_agents:
-            return None
+        with self._lock:
+            available_agents = [a for a in self.managed_agents.values() if a.status not in {AgentStatus.SUSPENDED, AgentStatus.BUSY}]
+            if not available_agents:
+                return None
 
-        task_description = task.description.lower()
+            task_description = task.description.lower()
 
-        def score(agent: BaseAgent) -> tuple[int, int, int]:
-            capability_match = 0
-            for capability in agent.capabilities.values():
-                capability_name = capability.name.lower()
-                capability_description = capability.description.lower()
-                if capability_name in task_description or task_description in capability_name:
-                    capability_match += 3
-                elif any(token and token in task_description for token in capability_description.split()):
-                    capability_match += 1
-            return (capability_match, -len(agent.active_tasks), int(agent.performance_metrics["success_rate"] * 100))
+            def score(agent: BaseAgent) -> tuple[int, int, int]:
+                capability_match = 0
+                for capability in agent.capabilities.values():
+                    capability_name = capability.name.lower()
+                    capability_description = capability.description.lower()
+                    if capability_name in task_description or task_description in capability_name:
+                        capability_match += 3
+                    elif any(token and token in task_description for token in capability_description.split()):
+                        capability_match += 1
+                return (capability_match, -len(agent.active_tasks), int(agent.performance_metrics["success_rate"] * 100))
 
-        return max(available_agents, key=score)
+            return max(available_agents, key=score)
 
     def get_system_status(self) -> Dict[str, Any]:
-        return {
-            "orchestrator": self.get_status(),
-            "managed_agents": [a.get_status() for a in self.managed_agents.values()],
-            "total_agents": len(self.managed_agents),
-            "pending_tasks": len(self.task_queue),
-        }
+        with self._lock:
+            return {
+                "orchestrator": self.get_status(),
+                "managed_agents": [a.get_status() for a in self.managed_agents.values()],
+                "total_agents": len(self.managed_agents),
+                "pending_tasks": len(self.task_queue),
+            }
 
 
 class ExecutorAgent(BaseAgent):
@@ -454,14 +523,38 @@ class LearnerAgent(BaseAgent):
 
 
 class AgentSystem:
-    def __init__(self, name: str = "Ai-morphasis", task_store: Optional[TaskStore] = None):
+    def __init__(
+        self,
+        name: str = "Ai-morphasis",
+        task_store: Optional[TaskStore] = None,
+        *,
+        default_lease_seconds: int = 300,
+        execution_timeout_seconds: Optional[float] = None,
+        persistence_retry_attempts: int = 3,
+        persistence_retry_backoff_seconds: float = 0.05,
+        max_persistence_backoff_seconds: float = 1.0,
+    ):
         if not name.strip():
             raise ValueError("System name cannot be empty")
+        if default_lease_seconds <= 0:
+            raise ValueError("default_lease_seconds must be > 0")
+        if persistence_retry_attempts <= 0:
+            raise ValueError("persistence_retry_attempts must be > 0")
+        if persistence_retry_backoff_seconds < 0:
+            raise ValueError("persistence_retry_backoff_seconds must be >= 0")
+        if max_persistence_backoff_seconds <= 0:
+            raise ValueError("max_persistence_backoff_seconds must be > 0")
 
         self.name = name
         self.id = str(uuid.uuid4())
         self.created_at = datetime.now()
+        self._lock = RLock()
         self.task_store = task_store or InMemoryTaskStore()
+        self.default_lease_seconds = default_lease_seconds
+        self.execution_timeout_seconds = execution_timeout_seconds
+        self.persistence_retry_attempts = persistence_retry_attempts
+        self.persistence_retry_backoff_seconds = persistence_retry_backoff_seconds
+        self.max_persistence_backoff_seconds = max_persistence_backoff_seconds
         self.orchestrator = OrchestratorAgent(f"{name}-Orchestrator")
         self.agents: Dict[str, BaseAgent] = {self.orchestrator.id: self.orchestrator}
         self.global_task_queue: List[Task] = []
@@ -477,178 +570,235 @@ class AgentSystem:
         logger.info("Initialized Agent System: %s", self.name)
 
     def add_agent(self, agent: BaseAgent) -> bool:
-        if agent.id in self.agents:
-            logger.warning("Agent %s is already present in system", agent.name)
-            return False
-        self.agents[agent.id] = agent
-        if not self.orchestrator.register_agent(agent):
-            self.agents.pop(agent.id, None)
-            return False
-        self.system_metrics["total_agents"] += 1
-        logger.info("Agent %s added to system", agent.name)
-        return True
+        with self._lock:
+            if agent.id in self.agents:
+                logger.warning("Agent %s is already present in system", agent.name)
+                return False
+            self.agents[agent.id] = agent
+            if not self.orchestrator.register_agent(agent):
+                self.agents.pop(agent.id, None)
+                return False
+            self.system_metrics["total_agents"] += 1
+            logger.info("Agent %s added to system", agent.name)
+            return True
 
     def remove_agent(self, agent_id: str) -> bool:
-        if agent_id == self.orchestrator.id:
-            logger.warning("Cannot remove the orchestrator agent from the system")
-            return False
-        if agent_id in self.agents:
-            agent = self.agents[agent_id]
-            if agent.active_tasks:
-                logger.warning("Cannot remove agent %s while it has active tasks", agent.name)
+        with self._lock:
+            if agent_id == self.orchestrator.id:
+                logger.warning("Cannot remove the orchestrator agent from the system")
                 return False
-            self.agents.pop(agent_id)
-            self.orchestrator.managed_agents.pop(agent_id, None)
-            self.system_metrics["total_agents"] -= 1
-            logger.info("Agent %s removed from system", agent.name)
-            return True
-        return False
+            if agent_id in self.agents:
+                agent = self.agents[agent_id]
+                with agent._lock:
+                    has_active_tasks = bool(agent.active_tasks)
+                if has_active_tasks:
+                    logger.warning("Cannot remove agent %s while it has active tasks", agent.name)
+                    return False
+                self.agents.pop(agent_id)
+                self.orchestrator.managed_agents.pop(agent_id, None)
+                self.system_metrics["total_agents"] -= 1
+                logger.info("Agent %s removed from system", agent.name)
+                return True
+            return False
 
     def get_agent(self, agent_id: str) -> Optional[BaseAgent]:
-        return self.agents.get(agent_id)
+        with self._lock:
+            return self.agents.get(agent_id)
 
     def create_task(self, description: str, parameters: Dict[str, Any], priority: TaskPriority = TaskPriority.NORMAL) -> Task:
-        task = Task(description=description, parameters=parameters, priority=priority)
-        self._set_claim(task, None)
-        self._enqueue_if_missing(task)
-        self.system_metrics["total_tasks"] += 1
-        self._store_task(task)
-        logger.info("Task %s created: %s", task.id, description)
-        return task
+        with self._lock:
+            task = Task(description=description, parameters=parameters, priority=priority)
+            self._set_claim(task, None)
+            self._enqueue_if_missing(task)
+            self.system_metrics["total_tasks"] += 1
+            self._store_task(task)
+            logger.info("task_created task_id=%s priority=%s description=%s", task.id, priority.name, description)
+            return task
 
     def submit_task(self, task: Task, agent_id: Optional[str] = None) -> bool:
-        persisted = self.load_task(task.id)
-        if persisted is not None:
-            task = persisted
+        with self._lock:
+            persisted = self.load_task(task.id)
+            if persisted is not None:
+                task = persisted
+            if task.status == TaskStatus.ASSIGNED and task.assigned_to == agent_id:
+                agent = self.agents.get(agent_id)
+                if agent and not agent.has_active_task(task.id):
+                    agent.assign_task(task)
+                self._dequeue_task(task.id)
+                logger.info("task_submit_idempotent task_id=%s agent_id=%s status=%s", task.id, agent_id, task.status.name)
+                return True
+            if task.status != TaskStatus.PENDING:
+                logger.warning("task_submit_rejected task_id=%s status=%s", task.id, task.status.name)
+                return False
 
-        if task.status != TaskStatus.PENDING:
-            logger.warning("Failed to submit task %s because it is in status %s", task.id, task.status.value)
+            assigned = False
+            if agent_id:
+                agent = self.agents.get(agent_id)
+                if agent:
+                    assigned = agent.assign_task(task)
+            else:
+                assigned = self.orchestrator.distribute_task(task)
+
+            if assigned:
+                self._set_task_status(task, TaskStatus.ASSIGNED, assigned_to=task.assigned_to, claimed_by=task.assigned_to)
+                self._dequeue_task(task.id)
+                logger.info("task_submitted task_id=%s agent_id=%s", task.id, task.assigned_to)
+                return True
+
+            logger.warning("task_submit_failed task_id=%s requested_agent_id=%s", task.id, agent_id)
             return False
 
-        assigned = False
-        if agent_id:
-            agent = self.get_agent(agent_id)
-            if agent:
-                assigned = agent.assign_task(task)
-        else:
-            assigned = self.orchestrator.distribute_task(task)
-
-        if assigned:
-            self._set_task_status(task, TaskStatus.ASSIGNED, assigned_to=task.assigned_to, claimed_by=task.assigned_to)
-            self._dequeue_task(task.id)
-            logger.info("Task %s submitted successfully", task.id)
-            return True
-
-        logger.warning("Failed to submit task %s", task.id)
-        return False
-
     def execute_task(self, task_id: str, agent_id: str) -> Any:
-        agent = self.get_agent(agent_id)
-        if not agent:
-            raise KeyError(f"Agent not found: {agent_id}")
-        task = agent.active_tasks.get(task_id)
-        if not task:
-            raise KeyError(f"Task {task_id} is not assigned to agent {agent_id}")
-
-        self._ensure_claimed_by(task, agent_id)
-        self._set_task_status(task, TaskStatus.RUNNING, assigned_to=agent_id, claimed_by=agent_id)
+        with self._lock:
+            agent = self.agents.get(agent_id)
+            if not agent:
+                raise KeyError(f"Agent not found: {agent_id}")
+            task = agent.get_active_task(task_id)
+            if not task:
+                raise KeyError(f"Task {task_id} is not assigned to agent {agent_id}")
+            stored_task = self.task_store.get_task(task_id)
+            if stored_task is not None:
+                persisted_task = self._from_stored_task(stored_task)
+                if (
+                    persisted_task.assigned_to
+                    and persisted_task.assigned_to != agent_id
+                    and not self._is_lease_expired(persisted_task)
+                ):
+                    raise ValueError(
+                        f"Task {task.id} is assigned to {persisted_task.assigned_to}, not {agent_id}"
+                    )
+                # Keep active in-memory task synchronized with persisted claim/lease metadata.
+                task.metadata = dict(persisted_task.metadata)
+                task.assigned_to = persisted_task.assigned_to
+                task.status = persisted_task.status
+            self._ensure_claimed_by(task, agent_id)
+            self._set_task_status(task, TaskStatus.RUNNING, assigned_to=agent_id, claimed_by=agent_id)
+            timeout_seconds = self._resolve_execution_timeout(task)
 
         start_time = datetime.now()
         try:
-            result = agent.run_task(task)
-            self._set_task_status(
-                task,
-                TaskStatus.COMPLETED,
-                assigned_to=agent_id,
-                claimed_by=agent_id,
-                result=result,
-                error=None,
-                completed_at=datetime.now(),
-            )
-            self._append_unique_task(self.completed_tasks, task)
-            self._update_system_metrics(success=True, start_time=start_time)
+            result = agent.run_task(task, timeout_seconds=timeout_seconds, heartbeat=lambda: self.heartbeat_task(task_id, agent_id))
+            with self._lock:
+                self._set_task_status(
+                    task,
+                    TaskStatus.COMPLETED,
+                    assigned_to=agent_id,
+                    claimed_by=agent_id,
+                    result=result,
+                    error=None,
+                    completed_at=datetime.now(),
+                )
+                self._append_unique_task(self.completed_tasks, task)
+                self._update_system_metrics(success=True, start_time=start_time)
             return result
         except Exception as exc:
-            self._set_task_status(
-                task,
-                TaskStatus.FAILED,
-                assigned_to=agent_id,
-                claimed_by=agent_id,
-                result=task.result,
-                error=str(exc),
-                completed_at=datetime.now(),
-            )
-            self._append_unique_task(self.failed_tasks, task)
-            self._update_system_metrics(success=False, start_time=start_time)
+            with self._lock:
+                self._set_task_status(
+                    task,
+                    TaskStatus.FAILED,
+                    assigned_to=agent_id,
+                    claimed_by=agent_id,
+                    result=task.result,
+                    error=str(exc),
+                    completed_at=datetime.now(),
+                )
+                self._append_unique_task(self.failed_tasks, task)
+                self._update_system_metrics(success=False, start_time=start_time)
             raise
 
     def cancel_task(self, task_id: str, reason: Optional[str] = None) -> Task:
-        task = self.load_task(task_id)
-        if task is None:
-            raise KeyError(f"Task not found: {task_id}")
-        if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
-            raise ValueError(f"Task {task_id} in status {task.status.value} cannot be cancelled")
+        with self._lock:
+            task = self.load_task(task_id)
+            if task is None:
+                raise KeyError(f"Task not found: {task_id}")
+            if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
+                raise ValueError(f"Task {task_id} in status {task.status.value} cannot be cancelled")
 
-        original_assigned_to = task.assigned_to
-        self._release_task_from_agent(task.id, original_assigned_to)
-        self._set_task_status(
-            task,
-            TaskStatus.CANCELLED,
-            assigned_to=None,
-            claimed_by=None,
-            result=None,
-            error=reason,
-            completed_at=datetime.now(),
-        )
-        self._dequeue_task(task.id)
-        return task
+            original_assigned_to = task.assigned_to
+            self._release_task_from_agent(task.id, original_assigned_to)
+            self._set_task_status(
+                task,
+                TaskStatus.CANCELLED,
+                assigned_to=None,
+                claimed_by=None,
+                result=None,
+                error=reason,
+                completed_at=datetime.now(),
+            )
+            self._dequeue_task(task.id)
+            logger.info("task_cancelled task_id=%s reason=%s", task.id, reason)
+            return task
 
     def load_task(self, task_id: str) -> Optional[Task]:
-        active_task = self._find_active_task(task_id)
-        if active_task is not None:
-            return active_task
-        stored_task = self.task_store.get_task(task_id)
-        if stored_task is None:
-            return None
-        return self._from_stored_task(stored_task)
+        with self._lock:
+            active_task = self._find_active_task(task_id)
+            if active_task is not None:
+                return active_task
+            stored_task = self.task_store.get_task(task_id)
+            if stored_task is None:
+                return None
+            return self._from_stored_task(stored_task)
 
     def list_persisted_tasks(self, status: Optional[TaskStatus] = None) -> List[Task]:
-        stored_tasks = self.task_store.list_tasks(status.name if status else None)
-        return [self._from_stored_task(task) for task in stored_tasks]
+        with self._lock:
+            stored_tasks = self.task_store.list_tasks(status.name if status else None)
+            return [self._from_stored_task(task) for task in stored_tasks]
 
     def recover_incomplete_tasks(self, reset_to: TaskStatus = TaskStatus.PENDING) -> int:
         if reset_to != TaskStatus.PENDING:
             raise ValueError("Only reset_to=TaskStatus.PENDING is supported for recovery")
 
         recovered = 0
-        for status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
-            for task in self.list_persisted_tasks(status):
-                active_task = self._find_active_task(task.id)
-                working_task = active_task or task
-                original_assigned_to = working_task.assigned_to
-                self._release_task_from_agent(working_task.id, original_assigned_to)
-                working_task.result = None
-                working_task.error = None
-                working_task.completed_at = None
-                self._set_task_status(working_task, TaskStatus.PENDING, assigned_to=None, claimed_by=None)
-                self._enqueue_if_missing(working_task)
-                recovered += 1
+        with self._lock:
+            for status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
+                for task in self.list_persisted_tasks(status):
+                    active_task = self._find_active_task(task.id)
+                    working_task = active_task or task
+                    if self._has_valid_lease(task):
+                        logger.info(
+                            "task_recovery_skipped_active_lease task_id=%s claimed_by=%s status=%s",
+                            task.id,
+                            self._get_claimed_by(task),
+                            task.status.name,
+                        )
+                        continue
+                    original_assigned_to = working_task.assigned_to
+                    self._release_task_from_agent(working_task.id, original_assigned_to)
+                    working_task.result = None
+                    working_task.error = None
+                    working_task.completed_at = None
+                    self._set_task_status(working_task, TaskStatus.PENDING, assigned_to=None, claimed_by=None)
+                    self._enqueue_if_missing(working_task)
+                    recovered += 1
 
-        logger.info("Recovered %s incomplete tasks", recovered)
+        logger.info("task_recovery_complete recovered=%s", recovered)
         return recovered
 
     def requeue_task(self, task_id: str) -> Task:
-        task = self.load_task(task_id)
-        if task is None:
-            raise KeyError(f"Task not found: {task_id}")
-        if not self._is_recoverable_status(task.status):
-            raise ValueError(f"Task {task_id} in status {task.status.value} cannot be requeued")
+        with self._lock:
+            task = self.load_task(task_id)
+            if task is None:
+                raise KeyError(f"Task not found: {task_id}")
+            if not self._is_recoverable_status(task.status):
+                raise ValueError(f"Task {task_id} in status {task.status.value} cannot be requeued")
+            if task.status in {TaskStatus.ASSIGNED, TaskStatus.RUNNING} and self._has_valid_lease(task):
+                raise ValueError(f"Task {task_id} has an active lease and cannot be requeued")
 
-        original_assigned_to = task.assigned_to
-        self._release_task_from_agent(task.id, original_assigned_to)
-        self._set_task_status(task, TaskStatus.PENDING, assigned_to=None, claimed_by=None, result=None, error=None, completed_at=None)
-        self._enqueue_if_missing(task)
-        return task
+            previous_status = task.status
+            original_assigned_to = task.assigned_to
+            self._release_task_from_agent(task.id, original_assigned_to)
+            self._set_task_status(
+                task,
+                TaskStatus.PENDING,
+                assigned_to=None,
+                claimed_by=None,
+                result=None,
+                error=None,
+                completed_at=None,
+            )
+            self._enqueue_if_missing(task)
+            logger.info("task_requeued task_id=%s previous_status=%s", task.id, previous_status.name)
+            return task
 
     def _to_stored_task(self, task: Task) -> StoredTask:
         return StoredTask(
@@ -667,12 +817,20 @@ class AgentSystem:
         )
 
     def _from_stored_task(self, stored_task: StoredTask) -> Task:
+        try:
+            priority = TaskPriority[stored_task.priority]
+        except KeyError:
+            priority = TaskPriority.NORMAL
+        try:
+            status = TaskStatus[stored_task.status]
+        except KeyError:
+            status = TaskStatus.PENDING
         return Task(
             id=stored_task.id,
             description=stored_task.description,
-            priority=TaskPriority[stored_task.priority],
+            priority=priority,
             assigned_to=stored_task.assigned_to,
-            status=TaskStatus[stored_task.status],
+            status=status,
             created_at=stored_task.created_at,
             completed_at=stored_task.completed_at,
             result=stored_task.result,
@@ -683,19 +841,68 @@ class AgentSystem:
         )
 
     def _store_task(self, task: Task) -> None:
-        self.task_store.create_task(self._to_stored_task(task))
+        for attempt in range(1, self.persistence_retry_attempts + 1):
+            try:
+                self.task_store.create_task(self._to_stored_task(task))
+                return
+            except ValueError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive for transient backend failures
+                if attempt == self.persistence_retry_attempts:
+                    logger.exception("task_store_create_failed task_id=%s attempts=%s", task.id, attempt)
+                    raise
+                backoff = self._calculate_persistence_backoff(attempt)
+                logger.warning(
+                    "task_store_create_retry task_id=%s attempt=%s max_attempts=%s backoff_seconds=%.3f error=%s",
+                    task.id,
+                    attempt,
+                    self.persistence_retry_attempts,
+                    backoff,
+                    exc,
+                )
+                sleep(backoff)
 
     def _update_task_record(self, task: Task) -> None:
-        try:
-            self.task_store.update_task(self._to_stored_task(task))
-        except Exception:
-            logger.exception(
-                "Failed to persist task update for task_id=%s assigned_to=%s status=%s",
-                task.id,
-                task.assigned_to,
-                task.status.name,
-            )
-            raise
+        for attempt in range(1, self.persistence_retry_attempts + 1):
+            try:
+                self.task_store.update_task(self._to_stored_task(task))
+                return
+            except (KeyError, ValueError):
+                raise
+            except Exception as exc:  # pragma: no cover - defensive for transient backend failures
+                if attempt == self.persistence_retry_attempts:
+                    logger.exception(
+                        "task_store_update_failed task_id=%s assigned_to=%s status=%s attempts=%s",
+                        task.id,
+                        task.assigned_to,
+                        task.status.name,
+                        attempt,
+                    )
+                    raise
+                backoff = self._calculate_persistence_backoff(attempt)
+                logger.warning(
+                    "task_store_update_retry task_id=%s status=%s attempt=%s max_attempts=%s backoff_seconds=%.3f error=%s",
+                    task.id,
+                    task.status.name,
+                    attempt,
+                    self.persistence_retry_attempts,
+                    backoff,
+                    exc,
+                )
+                sleep(backoff)
+
+    def heartbeat_task(self, task_id: str, agent_id: str, lease_seconds: Optional[int] = None) -> Task:
+        """Refresh a task lease while an agent is still actively working on it."""
+        with self._lock:
+            task = self.load_task(task_id)
+            if task is None:
+                raise KeyError(f"Task not found: {task_id}")
+            if task.status not in {TaskStatus.ASSIGNED, TaskStatus.RUNNING}:
+                raise ValueError(f"Task {task_id} in status {task.status.value} cannot refresh lease")
+            self._ensure_claimed_by(task, agent_id)
+            self._set_claim(task, claimed_by=agent_id, lease_seconds=lease_seconds)
+            self._update_task_record(task)
+            return task
 
     def _set_task_status(
         self,
@@ -708,6 +915,8 @@ class AgentSystem:
         error: Optional[str] = None,
         completed_at: Optional[datetime] = None,
     ) -> None:
+        previous_status = task.status
+        self._validate_task_transition(task.id, previous_status, status)
         task.status = status
         task.assigned_to = assigned_to
         task.result = result
@@ -715,17 +924,45 @@ class AgentSystem:
         task.completed_at = completed_at
         self._set_claim(task, claimed_by)
         self._update_task_record(task)
+        self._log_status_transition(task, previous_status, status)
 
-    def _set_claim(self, task: Task, claimed_by: Optional[str]) -> None:
+    def _set_claim(
+        self,
+        task: Task,
+        claimed_by: Optional[str],
+        *,
+        claimed_at: Optional[datetime] = None,
+        heartbeat_at: Optional[datetime] = None,
+        lease_seconds: Optional[int] = None,
+    ) -> None:
         task.metadata = dict(task.metadata)
         if claimed_by is None:
             task.metadata.pop("claimed_by", None)
+            task.metadata.pop("claimed_at", None)
+            task.metadata.pop("heartbeat_at", None)
+            task.metadata.pop("lease_expires_at", None)
         else:
+            now = datetime.now()
+            lease_duration = lease_seconds or self.default_lease_seconds
+            claim_time = claimed_at or now
+            heartbeat_time = heartbeat_at or now
             task.metadata["claimed_by"] = claimed_by
+            task.metadata["claimed_at"] = claim_time.isoformat()
+            task.metadata["heartbeat_at"] = heartbeat_time.isoformat()
+            task.metadata["lease_expires_at"] = (heartbeat_time + timedelta(seconds=lease_duration)).isoformat()
 
     def _ensure_claimed_by(self, task: Task, agent_id: str) -> None:
-        claimed_by = task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None
+        claimed_by = self._get_claimed_by(task)
         if claimed_by and claimed_by != agent_id:
+            if self._is_lease_expired(task):
+                logger.warning(
+                    "task_claim_stale task_id=%s stale_claimed_by=%s requested_by=%s lease_expires_at=%s",
+                    task.id,
+                    claimed_by,
+                    agent_id,
+                    self._get_claim_value(task, "lease_expires_at"),
+                )
+                return
             raise ValueError(f"Task {task.id} is claimed by {claimed_by}, not {agent_id}")
 
     def _is_recoverable_status(self, status: TaskStatus) -> bool:
@@ -733,7 +970,7 @@ class AgentSystem:
 
     def _find_active_task(self, task_id: str) -> Optional[Task]:
         for agent in self.agents.values():
-            task = agent.active_tasks.get(task_id)
+            task = agent.get_active_task(task_id)
             if task is not None:
                 return task
         return None
@@ -765,17 +1002,88 @@ class AgentSystem:
         if success and completed:
             self.system_metrics["avg_task_duration"] = previous_avg + ((elapsed - previous_avg) / completed)
 
+    def _resolve_execution_timeout(self, task: Task) -> Optional[float]:
+        metadata_timeout = task.metadata.get("execution_timeout_seconds") if isinstance(task.metadata, dict) else None
+        if metadata_timeout is None:
+            return self.execution_timeout_seconds
+        try:
+            timeout = float(metadata_timeout)
+        except (TypeError, ValueError):
+            logger.warning("invalid_task_timeout task_id=%s timeout=%s", task.id, metadata_timeout)
+            return self.execution_timeout_seconds
+        return timeout if timeout > 0 else self.execution_timeout_seconds
+
+    def _calculate_persistence_backoff(self, attempt: int) -> float:
+        bounded_exponent = min(max(attempt - 1, 0), MAX_BACKOFF_EXPONENT)
+        return min(
+            self.persistence_retry_backoff_seconds * (2**bounded_exponent),
+            self.max_persistence_backoff_seconds,
+        )
+
+    def _validate_task_transition(self, task_id: str, current: TaskStatus, new: TaskStatus) -> None:
+        if current == new:
+            return
+        allowed = ALLOWED_TASK_TRANSITIONS.get(current, set())
+        if new not in allowed:
+            raise ValueError(f"Invalid task transition for {task_id}: {current.name} -> {new.name}")
+
+    def _log_status_transition(self, task: Task, old_status: TaskStatus, new_status: TaskStatus) -> None:
+        if old_status == new_status:
+            return
+        logger.info(
+            "task_status_transition task_id=%s from=%s to=%s agent_id=%s claimed_by=%s lease_expires_at=%s error=%s",
+            task.id,
+            old_status.name,
+            new_status.name,
+            task.assigned_to,
+            self._get_claimed_by(task),
+            self._get_claim_value(task, "lease_expires_at"),
+            task.error,
+        )
+
+    def _get_claim_value(self, task: Task, key: str) -> Optional[str]:
+        if not isinstance(task.metadata, dict):
+            return None
+        value = task.metadata.get(key)
+        return value if isinstance(value, str) else None
+
+    def _get_claimed_by(self, task: Task) -> Optional[str]:
+        return self._get_claim_value(task, "claimed_by")
+
+    def _parse_claim_datetime(self, task: Task, key: str) -> Optional[datetime]:
+        raw = self._get_claim_value(task, key)
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _is_lease_expired(self, task: Task, at_time: Optional[datetime] = None) -> bool:
+        lease_expires_at = self._parse_claim_datetime(task, "lease_expires_at")
+        if lease_expires_at is None:
+            return False
+        now = at_time or datetime.now()
+        return lease_expires_at <= now
+
+    def _has_valid_lease(self, task: Task) -> bool:
+        claimed_by = self._get_claimed_by(task)
+        if not claimed_by:
+            return False
+        return not self._is_lease_expired(task)
+
     def get_system_status(self) -> Dict[str, Any]:
-        return {
-            "system_name": self.name,
-            "system_id": self.id,
-            "created_at": self.created_at.isoformat(),
-            "agents": {aid: agent.get_status() for aid, agent in self.agents.items()},
-            "metrics": _make_json_safe(self.system_metrics),
-            "pending_tasks": len(self.global_task_queue),
-            "completed_tasks": len(self.completed_tasks),
-            "failed_tasks": len(self.failed_tasks),
-        }
+        with self._lock:
+            return {
+                "system_name": self.name,
+                "system_id": self.id,
+                "created_at": self.created_at.isoformat(),
+                "agents": {aid: agent.get_status() for aid, agent in self.agents.items()},
+                "metrics": _make_json_safe(self.system_metrics),
+                "pending_tasks": len(self.global_task_queue),
+                "completed_tasks": len(self.completed_tasks),
+                "failed_tasks": len(self.failed_tasks),
+            }
 
     def to_json(self) -> str:
         return json.dumps(self.get_system_status(), indent=2, default=str)
