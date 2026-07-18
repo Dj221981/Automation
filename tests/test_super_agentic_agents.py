@@ -49,7 +49,7 @@ from src.models.neural_network import AgentLearningModel, ExperienceReplay
 
 
 class _SimpleAgent(BaseAgent):
-    """Minimal concrete agent for testing BaseAgent behaviour."""
+    """Minimal concrete agent for testing BaseAgent behavior."""
 
     def __init__(self, name: str = "Simple", fail: bool = False) -> None:
         super().__init__(name, role=AgentRole.EXECUTOR)
@@ -332,9 +332,9 @@ class TestAgentSystemPersistence:
         with pytest.raises(ValueError):
             system.save_snapshot("")
 
-    def test_load_snapshot_nonexistent_raises(self) -> None:
+    def test_load_snapshot_nonexistent_raises(self, tmp_path) -> None:
         with pytest.raises(FileNotFoundError):
-            AgentSystem.load_snapshot("/tmp/does_not_exist_xyz.json")
+            AgentSystem.load_snapshot(str(tmp_path / "does_not_exist_xyz.json"))
 
     def test_load_snapshot_invalid_filepath_raises(self) -> None:
         with pytest.raises(ValueError):
@@ -357,7 +357,7 @@ class TestAgentSystemPersistence:
 
 
 class TestExperienceReplayBehavior:
-    """Extended behaviour and concurrency tests for ExperienceReplay."""
+    """Extended behavior and concurrency tests for ExperienceReplay."""
 
     def _make_replay(self, size: int = 10, seed: int = 0) -> ExperienceReplay:
         return ExperienceReplay(state_size=4, max_size=size, seed=seed)
@@ -430,7 +430,7 @@ class TestExperienceReplayBehavior:
             replay.add(s, 0, np.inf, s, False)
 
     def test_overwrite_oldest_on_overflow(self) -> None:
-        """Ring-buffer behaviour: oldest experience is overwritten first."""
+        """Ring-buffer behavior: oldest experience is overwritten first."""
         replay = ExperienceReplay(state_size=1, max_size=2, seed=0)
         s_a = np.array([1.0], dtype=np.float32)
         s_b = np.array([2.0], dtype=np.float32)

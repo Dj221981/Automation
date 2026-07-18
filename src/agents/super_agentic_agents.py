@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -752,8 +753,6 @@ class AgentSystem:
         filepath:
             Destination file path.  Parent directories are created if missing.
         """
-        import os
-
         if not filepath or not isinstance(filepath, str):
             raise ValueError("filepath must be a non-empty string")
 
@@ -802,8 +801,6 @@ class AgentSystem:
         filepath:
             Path to a snapshot file previously created by :meth:`save_snapshot`.
         """
-        import os
-
         if not filepath or not isinstance(filepath, str):
             raise ValueError("filepath must be a non-empty string")
         if not os.path.exists(filepath):
