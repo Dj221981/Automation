@@ -184,6 +184,13 @@ class Task:
         }
 
 
+@dataclass(order=True, slots=True)
+class TaskQueueEntry:
+    sort_priority: int
+    created_at_ts: float
+    id: str = field(compare=True)
+
+
 class BaseAgent(ABC):
     """Abstract base class for all agents."""
 
@@ -560,10 +567,12 @@ class AgentSystem:
         self._max_persist_retries = 3
         self.claim_ttl_seconds = 60
         self.claim_grace_seconds = 10
+        self.retry_backoff_base_seconds = 5
+        self.retry_backoff_max_seconds = 300
         self.orchestrator = OrchestratorAgent(f"{name}-Orchestrator")
         self.agents: Dict[str, BaseAgent] = {self.orchestrator.id: self.orchestrator}
         self.max_queue_size = 10000
-        self.global_task_queue: List[tuple[int, float, str]] = []
+        self.global_task_queue: List[TaskQueueEntry] = []
         self._task_index: Set[str] = set()
         self.dead_letter_queue: deque[Dict[str, Any]] = deque(maxlen=2000)
         self.max_retries_per_task = 3
@@ -670,9 +679,13 @@ class AgentSystem:
 
     def submit_task(self, task: Task, agent_id: Optional[str] = None) -> bool:
         with self._lock:
-            persisted = self.load_task(task.id)
-            if persisted is not None:
-                task = persisted
+            active_task = self._find_active_task(task.id)
+            if active_task is not None and active_task is not task:
+                self._sync_task(task, active_task)
+            elif active_task is None:
+                stored = self.task_store.get_task(task.id)
+                if stored is not None:
+                    self._sync_task(task, self._from_stored_task(stored))
 
             if task.status != TaskStatus.PENDING:
                 logger.warning("Failed to submit task %s because it is in status %s", task.id, task.status.value)
@@ -728,6 +741,23 @@ class AgentSystem:
             return result
         except Exception as exc:
             with self._lock:
+                now = datetime.now()
+                if not isinstance(task.metadata, dict):
+                    task.metadata = {}
+                attempts = int(task.metadata.get("attempts", 0)) + 1
+                task.metadata["attempts"] = attempts
+                max_attempts = int(task.metadata.get("max_attempts", self.max_retries_per_task))
+                if attempts >= max_attempts:
+                    task.metadata["dead_lettered_at"] = now.isoformat()
+                    task.metadata["dead_letter_reason"] = str(exc)
+                    task.metadata.pop("next_retry_at", None)
+                    task.metadata.pop("retry_backoff_seconds", None)
+                else:
+                    retry_delay = self._calculate_retry_delay(attempts)
+                    task.metadata["retry_backoff_seconds"] = retry_delay
+                    task.metadata["next_retry_at"] = datetime.fromtimestamp(now.timestamp() + retry_delay).isoformat()
+                    task.metadata.pop("dead_lettered_at", None)
+                    task.metadata.pop("dead_letter_reason", None)
                 self._set_task_status(
                     task,
                     TaskStatus.FAILED,
@@ -735,40 +765,30 @@ class AgentSystem:
                     claimed_by=agent_id,
                     result=task.result,
                     error=str(exc),
-                    completed_at=datetime.now(),
+                    completed_at=now,
                 )
                 self._append_unique_task(self.failed_tasks, task)
                 self._update_system_metrics(success=False, start_time=start_time)
-                attempts = int(task.metadata.get("attempts", 0)) + 1 if isinstance(task.metadata, dict) else 1
-                if isinstance(task.metadata, dict):
-                    task.metadata["attempts"] = attempts
-                max_attempts = (
-                    int(task.metadata.get("max_attempts", self.max_retries_per_task))
-                    if isinstance(task.metadata, dict)
-                    else self.max_retries_per_task
-                )
                 if attempts >= max_attempts:
                     self.dead_letter_queue.append(
                         {
                             "task_id": task.id,
-                            "failed_at": datetime.now().isoformat(),
+                            "failed_at": now.isoformat(),
                             "error": str(exc),
                             "attempts": attempts,
                         }
                     )
                     self._emit_event("task_dead_lettered", task, {"attempts": attempts})
                 else:
-                    self._set_task_status(
+                    self._emit_event(
+                        "task_retry_scheduled",
                         task,
-                        TaskStatus.PENDING,
-                        assigned_to=None,
-                        claimed_by=None,
-                        result=None,
-                        error=str(exc),
-                        completed_at=None,
+                        {
+                            "attempts": attempts,
+                            "retry_backoff_seconds": task.metadata.get("retry_backoff_seconds"),
+                            "next_retry_at": task.metadata.get("next_retry_at"),
+                        },
                     )
-                    self._enqueue_if_missing(task)
-                    self._emit_event("task_requeued", task, {"attempts": attempts})
                 self._emit_event("task_failed", task, {"error": str(exc)})
             raise
 
@@ -967,6 +987,24 @@ class AgentSystem:
             task.metadata["claim_heartbeat_at"] = now.isoformat()
             task.metadata["claim_expires_at"] = datetime.fromtimestamp(now.timestamp() + self.claim_ttl_seconds).isoformat()
 
+    def _sync_task(self, target: Task, source: Task) -> None:
+        target.description = source.description
+        target.priority = source.priority
+        target.assigned_to = source.assigned_to
+        target.status = source.status
+        target.created_at = source.created_at
+        target.completed_at = source.completed_at
+        target.result = copy.deepcopy(source.result)
+        target.error = source.error
+        target.parameters = copy.deepcopy(source.parameters)
+        target.dependencies = copy.deepcopy(source.dependencies)
+        target.metadata = copy.deepcopy(source.metadata)
+
+    def _calculate_retry_delay(self, attempts: int) -> int:
+        bounded_attempts = max(1, int(attempts))
+        delay = self.retry_backoff_base_seconds * (2 ** (bounded_attempts - 1))
+        return min(delay, self.retry_backoff_max_seconds)
+
     def _ensure_claimed_by(self, task: Task, agent_id: str) -> None:
         claimed_by = task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None
         expires_raw = task.metadata.get("claim_expires_at") if isinstance(task.metadata, dict) else None
@@ -1003,12 +1041,14 @@ class AgentSystem:
             return
         if len(self._task_index) >= self.max_queue_size:
             raise OverflowError(f"Task queue full ({self.max_queue_size})")
-        heapq.heappush(self.global_task_queue, (-int(task.priority.value), task.created_at.timestamp(), task.id))
+        heapq.heappush(self.global_task_queue, TaskQueueEntry(-int(task.priority.value), task.created_at.timestamp(), task.id))
         self._task_index.add(task.id)
 
     def _dequeue_task(self, task_id: str) -> None:
         if task_id in self._task_index:
             self._task_index.remove(task_id)
+            self.global_task_queue = [entry for entry in self.global_task_queue if entry.id != task_id]
+            heapq.heapify(self.global_task_queue)
 
     def _append_unique_task(self, collection: List[Task], task: Task) -> None:
         if not any(existing.id == task.id for existing in collection):
@@ -1046,11 +1086,20 @@ class AgentSystem:
             }
 
     def get_observability_snapshot(self) -> Dict[str, Any]:
+        retry_backlog = 0
+        for task in self.list_persisted_tasks(TaskStatus.FAILED):
+            if task.metadata.get("next_retry_at"):
+                retry_backlog += 1
         return {
             "metrics": _make_json_safe(self.system_metrics),
             "recent_events": self.event_log[-200:],
             "queue_depth": len(self._task_index),
             "dead_letter_depth": len(self.dead_letter_queue),
+            "retry_backlog": retry_backlog,
+            "queue_limit": self.max_queue_size,
+            "retry_backoff_base_seconds": self.retry_backoff_base_seconds,
+            "retry_backoff_max_seconds": self.retry_backoff_max_seconds,
+            "recent_dead_letters": list(self.dead_letter_queue)[-20:],
         }
 
     def to_json(self) -> str:
