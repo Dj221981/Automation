@@ -1065,8 +1065,8 @@ class AgentSystem:
                     self.persistence_backoff_max_seconds,
                     self.persistence_backoff_min_seconds * (2**exponent),
                 )
-                normalized_jitter = (self._retry_random.random() - 0.5) * 2
-                jitter = base_delay * self.persistence_backoff_jitter_ratio * normalized_jitter
+                normalized_offset = (self._retry_random.random() - 0.5) * 2
+                jitter = base_delay * self.persistence_backoff_jitter_ratio * normalized_offset
                 time.sleep(min(self.persistence_backoff_max_seconds, max(0.0, base_delay + jitter)))
 
         self.system_metrics["persistence_failures"] += 1
@@ -1342,8 +1342,8 @@ class AgentSystem:
         for worker in list(self._worker_threads):
             start = time.monotonic()
             worker.join(remaining)
-            if initial_timeout is not None:
-                remaining = max(0.0, initial_timeout - (time.monotonic() - start))
+            if remaining is not None:
+                remaining = max(0.0, remaining - (time.monotonic() - start))
         self._worker_threads = [thread for thread in self._worker_threads if thread.is_alive()]
 
     def pause_processing(self) -> None:
