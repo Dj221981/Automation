@@ -1006,6 +1006,11 @@ class AgentSystem:
         self._update_retry_backlog(had_retry, False)
 
     def _sync_task(self, target: Task, source: Task) -> None:
+        """Copy the current state of a task into another task instance.
+
+        This keeps caller-held task objects aligned with the persisted or
+        active in-memory task instance chosen by the system.
+        """
         target.description = source.description
         target.priority = source.priority
         target.assigned_to = source.assigned_to
@@ -1032,6 +1037,11 @@ class AgentSystem:
         return min(delay, self.retry_backoff_max_seconds)
 
     def _update_retry_backlog(self, previous: bool, current: bool) -> None:
+        """Adjust the scheduled-retry backlog counter for a task transition.
+
+        `previous` and `current` indicate whether the task had or now has a
+        `next_retry_at` timestamp, respectively.
+        """
         if current and not previous:
             self._retry_backlog += 1
         elif not current and previous and self._retry_backlog > 0:
@@ -1087,9 +1097,19 @@ class AgentSystem:
             self._task_index.remove(task_id)
 
     def _is_queue_entry_live(self, entry: TaskQueueEntry) -> bool:
+        """Return True when the queue entry is still the current active entry.
+
+        Entries become stale when a task is dequeued or re-enqueued with a
+        newer generation after recovery or manual requeue.
+        """
         return entry.id in self._task_index and entry.generation == self._queue_generations.get(entry.id)
 
     def _compact_queue_if_needed(self) -> None:
+        """Drop stale queue entries after lazy removals grow the heap.
+
+        Compaction is deferred until the internal heap grows beyond twice the
+        configured queue limit to avoid O(n) work on every dequeue.
+        """
         if len(self._global_task_queue) <= (self.max_queue_size * 2):
             return
         self._global_task_queue = [entry for entry in self._global_task_queue if self._is_queue_entry_live(entry)]

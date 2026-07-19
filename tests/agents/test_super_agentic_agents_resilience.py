@@ -7,7 +7,7 @@ class FailingExecutorAgent(ExecutorAgent):
         raise RuntimeError("boom")
 
 
-def test_failed_execution_tracks_retry_metadata_without_auto_requeue():
+def test_failed_task_tracks_retry_metadata():
     store = InMemoryTaskStore()
     system = AgentSystem("retry-metadata", task_store=store)
     agent = FailingExecutorAgent("worker")
@@ -34,7 +34,7 @@ def test_failed_execution_tracks_retry_metadata_without_auto_requeue():
     assert task.id not in system._task_index
 
 
-def test_manual_requeue_then_second_failure_moves_task_to_dead_letter():
+def test_max_retries_moves_task_to_dead_letter():
     store = InMemoryTaskStore()
     system = AgentSystem("dead-letter", task_store=store)
     system.max_retries_per_task = 2
