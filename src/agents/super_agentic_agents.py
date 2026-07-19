@@ -21,13 +21,14 @@ import copy
 import heapq
 import json
 import logging
+import random
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -182,6 +183,16 @@ class Task:
             "dependencies": list(self.dependencies),
             "metadata": _make_json_safe(self.metadata),
         }
+
+
+@dataclass(order=True, slots=True)
+class QueuedTask:
+    """Represents a heap-backed queued task entry."""
+
+    priority_rank: int
+    created_at_ts: float
+    sequence: int
+    id: str = field(compare=False)
 
 
 class BaseAgent(ABC):
@@ -558,19 +569,32 @@ class AgentSystem:
         self._lock = threading.RLock()
         self._task_versions: Dict[str, int] = {}
         self._max_persist_retries = 3
+        self.persistence_backoff_min_seconds = 0.01
+        self.persistence_backoff_max_seconds = 0.25
+        self.persistence_backoff_jitter_factor = 0.1
+        self._retry_random = random.Random()
         self.claim_ttl_seconds = 60
         self.claim_grace_seconds = 10
+        self.claim_sweep_interval_seconds = 1.0
+        self.worker_poll_interval_seconds = 0.05
         self.orchestrator = OrchestratorAgent(f"{name}-Orchestrator")
         self.agents: Dict[str, BaseAgent] = {self.orchestrator.id: self.orchestrator}
         self.max_queue_size = 10000
-        self.global_task_queue: List[tuple[int, float, str]] = []
+        self.global_task_queue: List[QueuedTask] = []
         self._task_index: Set[str] = set()
+        self._queue_sequence = 0
         self.dead_letter_queue: deque[Dict[str, Any]] = deque(maxlen=2000)
         self.max_retries_per_task = 3
         self.completed_tasks: List[Task] = []
         self.failed_tasks: List[Task] = []
         self.event_log: List[Dict[str, Any]] = []
         self.max_events = 10000
+        self._idempotency_index: Dict[str, str] = {}
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()
+        self._worker_threads: List[threading.Thread] = []
+        self._maintenance_thread: Optional[threading.Thread] = None
         self.system_metrics = {
             "total_agents": 1,
             "total_tasks": 0,
@@ -580,15 +604,26 @@ class AgentSystem:
             "avg_task_duration_success": 0.0,
             "avg_task_duration_failure": 0.0,
             "avg_task_duration_overall": 0.0,
+            "queue_stale_pops": 0,
+            "dependency_blocked_tasks": 0,
+            "claim_reclaims": 0,
+            "persistence_retry_attempts": 0,
+            "persistence_failures": 0,
         }
         logger.info("Initialized Agent System: %s", self.name)
 
     def _emit_event(self, event_type: str, task: Optional[Task] = None, extra: Optional[Dict[str, Any]] = None) -> None:
+        correlation_id = None
+        if task is not None and isinstance(task.metadata, dict):
+            correlation_id = task.metadata.get("correlation_id")
+        elif extra and isinstance(extra, dict):
+            correlation_id = extra.get("correlation_id")
         payload: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "event_type": event_type,
             "system_id": self.id,
             "system_name": self.name,
+            "correlation_id": correlation_id,
         }
         if task is not None:
             payload.update(
@@ -597,7 +632,6 @@ class AgentSystem:
                     "task_status": task.status.value,
                     "assigned_to": task.assigned_to,
                     "claimed_by": task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None,
-                    "correlation_id": task.metadata.get("correlation_id") if isinstance(task.metadata, dict) else None,
                 }
             )
         if extra:
@@ -620,6 +654,72 @@ class AgentSystem:
         if not isinstance(task.metadata, dict):
             task.metadata = {}
         task.metadata["_version"] = int(version)
+
+    def _ensure_task_metadata(self, task: Task) -> Dict[str, Any]:
+        if not isinstance(task.metadata, dict):
+            task.metadata = {}
+        return task.metadata
+
+    def _parse_datetime(self, raw: Any) -> Optional[datetime]:
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _synchronize_task(self, target: Task, source: Task) -> Task:
+        target.description = source.description
+        target.priority = source.priority
+        target.assigned_to = source.assigned_to
+        target.status = source.status
+        target.created_at = source.created_at
+        target.completed_at = source.completed_at
+        target.result = copy.deepcopy(source.result)
+        target.error = source.error
+        target.parameters = copy.deepcopy(dict(source.parameters))
+        target.dependencies = copy.deepcopy(list(source.dependencies))
+        target.metadata = copy.deepcopy(dict(source.metadata))
+        return target
+
+    def _extract_idempotency_key(
+        self, parameters: Optional[Dict[str, Any]], metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        nested_metadata = parameters.get("metadata") if isinstance(parameters, dict) else None
+        candidates = [
+            metadata.get("idempotency_key") if isinstance(metadata, dict) else None,
+            parameters.get("idempotency_key") if isinstance(parameters, dict) else None,
+            nested_metadata.get("idempotency_key") if isinstance(nested_metadata, dict) else None,
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+
+    def _find_task_by_idempotency_key(self, idempotency_key: str) -> Optional[Task]:
+        task_id = self._idempotency_index.get(idempotency_key)
+        if task_id:
+            task = self.load_task(task_id)
+            if task is not None:
+                return task
+            self._idempotency_index.pop(idempotency_key, None)
+
+        for task in self.list_persisted_tasks():
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            if metadata.get("idempotency_key") == idempotency_key:
+                self._idempotency_index[idempotency_key] = task.id
+                return task
+        return None
+
+    def _get_unmet_dependencies(self, task: Task) -> List[str]:
+        unmet: List[str] = []
+        for dependency_id in list(task.dependencies):
+            if not isinstance(dependency_id, str) or not dependency_id.strip():
+                continue
+            dependency = self.load_task(dependency_id)
+            if dependency is None or dependency.status != TaskStatus.COMPLETED:
+                unmet.append(dependency_id)
+        return unmet
 
     def add_agent(self, agent: BaseAgent) -> bool:
         with self._lock:
@@ -654,12 +754,39 @@ class AgentSystem:
     def get_agent(self, agent_id: str) -> Optional[BaseAgent]:
         return self.agents.get(agent_id)
 
-    def create_task(self, description: str, parameters: Dict[str, Any], priority: TaskPriority = TaskPriority.NORMAL) -> Task:
+    def create_task(
+        self,
+        description: str,
+        parameters: Dict[str, Any],
+        priority: TaskPriority = TaskPriority.NORMAL,
+        dependencies: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Task:
         with self._lock:
-            task = Task(description=description, parameters=parameters, priority=priority)
-            task.metadata.setdefault("correlation_id", str(uuid.uuid4()))
-            task.metadata.setdefault("attempts", 0)
-            task.metadata.setdefault("max_attempts", self.max_retries_per_task)
+            safe_parameters = copy.deepcopy(parameters) if isinstance(parameters, dict) else {}
+            safe_metadata = copy.deepcopy(metadata) if isinstance(metadata, dict) else {}
+            safe_dependencies = list(dependencies) if dependencies is not None else list(safe_parameters.get("dependencies", []))
+            idempotency_key = self._extract_idempotency_key(safe_parameters, safe_metadata)
+            if idempotency_key:
+                existing = self._find_task_by_idempotency_key(idempotency_key)
+                if existing is not None:
+                    self._emit_event("task_create_deduplicated", existing, {"idempotency_key": idempotency_key})
+                    return existing
+
+            task = Task(
+                description=description,
+                parameters=safe_parameters,
+                priority=priority,
+                dependencies=safe_dependencies,
+                metadata=safe_metadata,
+            )
+            task_metadata = self._ensure_task_metadata(task)
+            task_metadata.setdefault("correlation_id", str(uuid.uuid4()))
+            task_metadata.setdefault("attempts", 0)
+            task_metadata.setdefault("max_attempts", self.max_retries_per_task)
+            if idempotency_key:
+                task_metadata["idempotency_key"] = idempotency_key
+                self._idempotency_index[idempotency_key] = task.id
             self._set_claim(task, None)
             self._enqueue_if_missing(task)
             self.system_metrics["total_tasks"] += 1
@@ -671,11 +798,18 @@ class AgentSystem:
     def submit_task(self, task: Task, agent_id: Optional[str] = None) -> bool:
         with self._lock:
             persisted = self.load_task(task.id)
-            if persisted is not None:
-                task = persisted
+            if persisted is not None and persisted is not task:
+                self._synchronize_task(task, persisted)
 
             if task.status != TaskStatus.PENDING:
                 logger.warning("Failed to submit task %s because it is in status %s", task.id, task.status.value)
+                return False
+            unmet_dependencies = self._get_unmet_dependencies(task)
+            if unmet_dependencies:
+                self.system_metrics["dependency_blocked_tasks"] += 1
+                self._enqueue_if_missing(task)
+                self._emit_event("task_dependency_blocked", task, {"dependencies": unmet_dependencies})
+                logger.info("Task %s blocked by unmet dependencies: %s", task.id, unmet_dependencies)
                 return False
 
             assigned = False
@@ -694,6 +828,7 @@ class AgentSystem:
                 return True
 
             logger.warning("Failed to submit task %s", task.id)
+            self._enqueue_if_missing(task)
             return False
 
     def execute_task(self, task_id: str, agent_id: str) -> Any:
@@ -704,7 +839,14 @@ class AgentSystem:
             task = agent.active_tasks.get(task_id)
             if not task:
                 raise KeyError(f"Task {task_id} is not assigned to agent {agent_id}")
-
+            unmet_dependencies = self._get_unmet_dependencies(task)
+            if unmet_dependencies:
+                self.system_metrics["dependency_blocked_tasks"] += 1
+                self._release_task_from_agent(task.id, agent_id)
+                self._set_task_status(task, TaskStatus.PENDING, assigned_to=None, claimed_by=None, completed_at=None)
+                self._enqueue_if_missing(task)
+                self._emit_event("task_dependency_blocked", task, {"dependencies": unmet_dependencies})
+                raise ValueError(f"Task {task.id} blocked by unmet dependencies")
             self._ensure_claimed_by(task, agent_id)
             self._set_task_status(task, TaskStatus.RUNNING, assigned_to=agent_id, claimed_by=agent_id)
             self._emit_event("task_running", task)
@@ -757,18 +899,6 @@ class AgentSystem:
                         }
                     )
                     self._emit_event("task_dead_lettered", task, {"attempts": attempts})
-                else:
-                    self._set_task_status(
-                        task,
-                        TaskStatus.PENDING,
-                        assigned_to=None,
-                        claimed_by=None,
-                        result=None,
-                        error=str(exc),
-                        completed_at=None,
-                    )
-                    self._enqueue_if_missing(task)
-                    self._emit_event("task_requeued", task, {"attempts": attempts})
                 self._emit_event("task_failed", task, {"error": str(exc)})
             raise
 
@@ -916,10 +1046,19 @@ class AgentSystem:
                 return
             except Exception as exc:
                 last_exc = exc
+                self.system_metrics["persistence_retry_attempts"] += 1
+                self._emit_event("task_persistence_retry", task, {"attempt": attempt, "error": str(exc)})
                 if attempt >= self._max_persist_retries:
                     break
-                time.sleep(0.01 * attempt)
+                base_delay = min(
+                    self.persistence_backoff_max_seconds,
+                    self.persistence_backoff_min_seconds * (2 ** (attempt - 1)),
+                )
+                jitter = base_delay * self.persistence_backoff_jitter_factor * self._retry_random.random()
+                time.sleep(min(self.persistence_backoff_max_seconds, base_delay + jitter))
 
+        self.system_metrics["persistence_failures"] += 1
+        self._emit_event("task_persistence_terminal_failure", task, {"error": str(last_exc) if last_exc else None})
         logger.exception(
             "Failed to persist task update after retries for task_id=%s assigned_to=%s status=%s",
             task.id,
@@ -954,28 +1093,24 @@ class AgentSystem:
         self._update_task_record(task)
 
     def _set_claim(self, task: Task, claimed_by: Optional[str]) -> None:
-        task.metadata = dict(task.metadata)
+        metadata = self._ensure_task_metadata(task)
         now = datetime.now()
         if claimed_by is None:
-            task.metadata.pop("claimed_by", None)
-            task.metadata.pop("claim_token", None)
-            task.metadata.pop("claim_expires_at", None)
-            task.metadata.pop("claim_heartbeat_at", None)
+            metadata.pop("claimed_by", None)
+            metadata.pop("claim_token", None)
+            metadata.pop("claim_expires_at", None)
+            metadata.pop("claim_heartbeat_at", None)
         else:
-            task.metadata["claimed_by"] = claimed_by
-            task.metadata["claim_token"] = str(uuid.uuid4())
-            task.metadata["claim_heartbeat_at"] = now.isoformat()
-            task.metadata["claim_expires_at"] = datetime.fromtimestamp(now.timestamp() + self.claim_ttl_seconds).isoformat()
+            existing_token = metadata.get("claim_token") if metadata.get("claimed_by") == claimed_by else None
+            metadata["claimed_by"] = claimed_by
+            metadata["claim_token"] = existing_token if isinstance(existing_token, str) and existing_token else str(uuid.uuid4())
+            metadata["claim_heartbeat_at"] = now.isoformat()
+            metadata["claim_expires_at"] = (now + timedelta(seconds=self.claim_ttl_seconds)).isoformat()
 
     def _ensure_claimed_by(self, task: Task, agent_id: str) -> None:
-        claimed_by = task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None
-        expires_raw = task.metadata.get("claim_expires_at") if isinstance(task.metadata, dict) else None
-        expires_at: Optional[datetime] = None
-        if isinstance(expires_raw, str):
-            try:
-                expires_at = datetime.fromisoformat(expires_raw)
-            except Exception:
-                expires_at = None
+        metadata = self._ensure_task_metadata(task)
+        claimed_by = metadata.get("claimed_by")
+        expires_at = self._parse_datetime(metadata.get("claim_expires_at"))
         if claimed_by and expires_at and expires_at <= datetime.now():
             raise ValueError(f"Task {task.id} claim expired for {claimed_by}")
         if claimed_by and claimed_by != agent_id:
@@ -1003,12 +1138,208 @@ class AgentSystem:
             return
         if len(self._task_index) >= self.max_queue_size:
             raise OverflowError(f"Task queue full ({self.max_queue_size})")
-        heapq.heappush(self.global_task_queue, (-int(task.priority.value), task.created_at.timestamp(), task.id))
+        entry = QueuedTask(
+            priority_rank=-int(task.priority.value),
+            created_at_ts=task.created_at.timestamp(),
+            sequence=self._queue_sequence,
+            id=task.id,
+        )
+        self._queue_sequence += 1
+        heapq.heappush(self.global_task_queue, entry)
         self._task_index.add(task.id)
 
     def _dequeue_task(self, task_id: str) -> None:
-        if task_id in self._task_index:
-            self._task_index.remove(task_id)
+        self._task_index.discard(task_id)
+        if not self.global_task_queue:
+            return
+        retained = [queued for queued in self.global_task_queue if queued.id != task_id]
+        if len(retained) != len(self.global_task_queue):
+            self.global_task_queue = retained
+            heapq.heapify(self.global_task_queue)
+
+    def _pop_next_valid_task_id(self) -> Optional[str]:
+        while self.global_task_queue:
+            queued = heapq.heappop(self.global_task_queue)
+            if queued.id not in self._task_index:
+                self.system_metrics["queue_stale_pops"] += 1
+                continue
+            task = self.load_task(queued.id)
+            if task is None or task.status != TaskStatus.PENDING:
+                self._task_index.discard(queued.id)
+                self.system_metrics["queue_stale_pops"] += 1
+                continue
+            self._task_index.discard(queued.id)
+            return queued.id
+        return None
+
+    def renew_task_claim(self, task_id: str, agent_id: Optional[str] = None) -> bool:
+        """Refresh the lease heartbeat for an assigned or running task."""
+        with self._lock:
+            task = self._find_active_task(task_id) or self.load_task(task_id)
+            if task is None or task.status not in {TaskStatus.ASSIGNED, TaskStatus.RUNNING}:
+                return False
+            metadata = self._ensure_task_metadata(task)
+            claimed_by = metadata.get("claimed_by")
+            if not isinstance(claimed_by, str) or not claimed_by:
+                return False
+            if agent_id is not None and claimed_by != agent_id:
+                return False
+            expires_at = self._parse_datetime(metadata.get("claim_expires_at"))
+            if expires_at is not None and expires_at + timedelta(seconds=self.claim_grace_seconds) <= datetime.now():
+                return False
+            self._set_claim(task, claimed_by)
+            self._update_task_record(task)
+            self._emit_event("task_claim_renewed", task)
+            return True
+
+    def reclaim_expired_claims(self) -> int:
+        """Reclaim expired task leases and return tasks to the pending queue."""
+        with self._lock:
+            reclaimed = 0
+            candidates: Dict[str, Task] = {}
+            for status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
+                for task in self.list_persisted_tasks(status):
+                    candidates[task.id] = task
+            for agent in self.agents.values():
+                for task in agent.active_tasks.values():
+                    candidates[task.id] = task
+
+            now = datetime.now()
+            for task in candidates.values():
+                metadata = self._ensure_task_metadata(task)
+                claimed_by = metadata.get("claimed_by")
+                expires_at = self._parse_datetime(metadata.get("claim_expires_at"))
+                if not isinstance(claimed_by, str) or expires_at is None:
+                    continue
+                if expires_at + timedelta(seconds=self.claim_grace_seconds) > now:
+                    continue
+                self._release_task_from_agent(task.id, task.assigned_to)
+                self._set_task_status(
+                    task,
+                    TaskStatus.PENDING,
+                    assigned_to=None,
+                    claimed_by=None,
+                    result=None,
+                    error="claim expired",
+                    completed_at=None,
+                )
+                self._enqueue_if_missing(task)
+                self.system_metrics["claim_reclaims"] += 1
+                reclaimed += 1
+                self._emit_event("task_claim_reclaimed", task, {"previous_claimed_by": claimed_by})
+            return reclaimed
+
+    def process_next_pending_task(self) -> bool:
+        """Assign and execute the next valid pending task from the queue."""
+        with self._lock:
+            task_id = self._pop_next_valid_task_id()
+            if task_id is None:
+                return False
+            task = self.load_task(task_id)
+            if task is None or task.status != TaskStatus.PENDING:
+                return False
+
+        if not self.submit_task(task):
+            return False
+
+        assigned_to = task.assigned_to
+        if not assigned_to:
+            return False
+        self.execute_task(task.id, assigned_to)
+        return True
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            if not self._pause_event.is_set():
+                self._pause_event.wait(self.worker_poll_interval_seconds)
+                continue
+            try:
+                processed = self.process_next_pending_task()
+            except Exception:
+                logger.exception("Worker loop failed while processing task")
+                processed = False
+            if not processed:
+                self._stop_event.wait(self.worker_poll_interval_seconds)
+
+    def _maintenance_loop(self) -> None:
+        while not self._stop_event.wait(self.claim_sweep_interval_seconds):
+            try:
+                with self._lock:
+                    active_tasks = [task for agent in self.agents.values() for task in agent.active_tasks.values()]
+                for task in active_tasks:
+                    self.renew_task_claim(task.id, task.assigned_to)
+                self.reclaim_expired_claims()
+            except Exception:
+                logger.exception("Maintenance loop failed")
+
+    def start_workers(self, worker_count: int = 1) -> None:
+        """Start background workers and lease maintenance threads."""
+        if worker_count <= 0:
+            raise ValueError("worker_count must be greater than 0")
+        with self._lock:
+            self._stop_event.clear()
+            self._pause_event.set()
+            if self._maintenance_thread is None or not self._maintenance_thread.is_alive():
+                self._maintenance_thread = threading.Thread(
+                    target=self._maintenance_loop,
+                    name=f"{self.name}-maintenance",
+                    daemon=True,
+                )
+                self._maintenance_thread.start()
+            alive_workers = [thread for thread in self._worker_threads if thread.is_alive()]
+            self._worker_threads = alive_workers
+            while len(self._worker_threads) < worker_count:
+                worker = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"{self.name}-worker-{len(self._worker_threads) + 1}",
+                    daemon=True,
+                )
+                worker.start()
+                self._worker_threads.append(worker)
+
+    def stop_workers(self, timeout_seconds: Optional[float] = None) -> None:
+        """Request worker shutdown and optionally wait for threads to stop."""
+        self._stop_event.set()
+        self._pause_event.set()
+        wait_timeout = None if timeout_seconds is None else max(timeout_seconds, 0.0)
+        if self._maintenance_thread is not None:
+            self._maintenance_thread.join(wait_timeout)
+            if not self._maintenance_thread.is_alive():
+                self._maintenance_thread = None
+        remaining = wait_timeout
+        for worker in list(self._worker_threads):
+            start = time.monotonic()
+            worker.join(remaining)
+            if wait_timeout is not None:
+                remaining = max(0.0, wait_timeout - (time.monotonic() - start))
+        self._worker_threads = [thread for thread in self._worker_threads if thread.is_alive()]
+
+    def pause_processing(self) -> None:
+        """Pause worker task consumption without stopping maintenance."""
+        self._pause_event.clear()
+
+    def resume_processing(self) -> None:
+        """Resume worker task consumption after a pause."""
+        self._pause_event.set()
+
+    def drain_and_shutdown(self, timeout_seconds: float = 5.0) -> bool:
+        """Stop workers, wait for active tasks to settle, and persist current state."""
+        timeout_seconds = max(timeout_seconds, 0.0)
+        deadline = time.monotonic() + timeout_seconds
+        self.stop_workers(timeout_seconds=timeout_seconds)
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not any(agent.active_tasks for agent in self.agents.values()):
+                    break
+            time.sleep(0.01)
+        with self._lock:
+            for task in self.list_persisted_tasks():
+                self._idempotency_index.update(
+                    {task.metadata["idempotency_key"]: task.id}
+                    if isinstance(task.metadata, dict) and isinstance(task.metadata.get("idempotency_key"), str)
+                    else {}
+                )
+            return not any(agent.active_tasks for agent in self.agents.values())
 
     def _append_unique_task(self, collection: List[Task], task: Task) -> None:
         if not any(existing.id == task.id for existing in collection):
@@ -1043,6 +1374,8 @@ class AgentSystem:
                 "completed_tasks": len(self.completed_tasks),
                 "failed_tasks": len(self.failed_tasks),
                 "dead_letter_tasks": len(self.dead_letter_queue),
+                "processing_paused": not self._pause_event.is_set(),
+                "worker_threads": len([thread for thread in self._worker_threads if thread.is_alive()]),
             }
 
     def get_observability_snapshot(self) -> Dict[str, Any]:
@@ -1051,6 +1384,8 @@ class AgentSystem:
             "recent_events": self.event_log[-200:],
             "queue_depth": len(self._task_index),
             "dead_letter_depth": len(self.dead_letter_queue),
+            "worker_threads": len([thread for thread in self._worker_threads if thread.is_alive()]),
+            "processing_paused": not self._pause_event.is_set(),
         }
 
     def to_json(self) -> str:
