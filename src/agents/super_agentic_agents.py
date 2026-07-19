@@ -1050,9 +1050,10 @@ class AgentSystem:
                 self._emit_event("task_persistence_retry", task, {"attempt": attempt, "error": str(exc)})
                 if attempt >= self._max_persist_retries:
                     break
+                exponent = min(attempt - 1, 6)
                 base_delay = min(
                     self.persistence_backoff_max_seconds,
-                    self.persistence_backoff_min_seconds * (2 ** (attempt - 1)),
+                    self.persistence_backoff_min_seconds * (2**exponent),
                 )
                 jitter = base_delay * self.persistence_backoff_jitter_factor * self._retry_random.random()
                 time.sleep(min(self.persistence_backoff_max_seconds, base_delay + jitter))
@@ -1192,6 +1193,27 @@ class AgentSystem:
             self._emit_event("task_claim_renewed", task)
             return True
 
+    def _renew_active_claims(self) -> int:
+        renewed = 0
+        with self._lock:
+            now = datetime.now()
+            for agent in self.agents.values():
+                for task in agent.active_tasks.values():
+                    if task.status not in {TaskStatus.ASSIGNED, TaskStatus.RUNNING}:
+                        continue
+                    metadata = self._ensure_task_metadata(task)
+                    claimed_by = metadata.get("claimed_by")
+                    expires_at = self._parse_datetime(metadata.get("claim_expires_at"))
+                    if not isinstance(claimed_by, str) or not claimed_by:
+                        continue
+                    if expires_at is not None and expires_at + timedelta(seconds=self.claim_grace_seconds) <= now:
+                        continue
+                    self._set_claim(task, claimed_by)
+                    self._update_task_record(task)
+                    self._emit_event("task_claim_renewed", task)
+                    renewed += 1
+        return renewed
+
     def reclaim_expired_claims(self) -> int:
         """Reclaim expired task leases and return tasks to the pending queue."""
         with self._lock:
@@ -1264,10 +1286,7 @@ class AgentSystem:
     def _maintenance_loop(self) -> None:
         while not self._stop_event.wait(self.claim_sweep_interval_seconds):
             try:
-                with self._lock:
-                    active_tasks = [task for agent in self.agents.values() for task in agent.active_tasks.values()]
-                for task in active_tasks:
-                    self.renew_task_claim(task.id, task.assigned_to)
+                self._renew_active_claims()
                 self.reclaim_expired_claims()
             except Exception:
                 logger.exception("Maintenance loop failed")
@@ -1333,12 +1352,6 @@ class AgentSystem:
                     break
             time.sleep(0.01)
         with self._lock:
-            for task in self.list_persisted_tasks():
-                self._idempotency_index.update(
-                    {task.metadata["idempotency_key"]: task.id}
-                    if isinstance(task.metadata, dict) and isinstance(task.metadata.get("idempotency_key"), str)
-                    else {}
-                )
             return not any(agent.active_tasks for agent in self.agents.values())
 
     def _append_unique_task(self, collection: List[Task], task: Task) -> None:

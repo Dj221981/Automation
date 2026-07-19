@@ -9,10 +9,11 @@ class BlockingExecutorAgent(ExecutorAgent):
         super().__init__(name)
         self.started = threading.Event()
         self.finished = threading.Event()
+        self.wait_timeout_seconds = 2.0
 
     def act(self, decision):
         self.started.set()
-        self.finished.wait(1.0)
+        self.finished.wait(self.wait_timeout_seconds)
         return super().act(decision)
 
 
