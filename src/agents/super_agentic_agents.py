@@ -571,7 +571,8 @@ class AgentSystem:
         self._max_persist_retries = 3
         self.persistence_backoff_min_seconds = 0.01
         self.persistence_backoff_max_seconds = 0.25
-        self.persistence_backoff_jitter_factor = 0.1
+        self.persistence_backoff_max_exponent = 6
+        self.persistence_backoff_jitter_ratio = 0.1
         self._retry_random = random.Random()
         self.claim_ttl_seconds = 60
         self.claim_grace_seconds = 10
@@ -1050,13 +1051,14 @@ class AgentSystem:
                 self._emit_event("task_persistence_retry", task, {"attempt": attempt, "error": str(exc)})
                 if attempt >= self._max_persist_retries:
                     break
-                exponent = min(attempt - 1, 6)
+                exponent = min(attempt - 1, self.persistence_backoff_max_exponent)
                 base_delay = min(
                     self.persistence_backoff_max_seconds,
                     self.persistence_backoff_min_seconds * (2**exponent),
                 )
-                jitter = base_delay * self.persistence_backoff_jitter_factor * self._retry_random.random()
-                time.sleep(min(self.persistence_backoff_max_seconds, base_delay + jitter))
+                jitter_multiplier = (self._retry_random.random() * 2) - 1
+                jitter = base_delay * self.persistence_backoff_jitter_ratio * jitter_multiplier
+                time.sleep(min(self.persistence_backoff_max_seconds, max(0.0, base_delay + jitter)))
 
         self.system_metrics["persistence_failures"] += 1
         self._emit_event("task_persistence_terminal_failure", task, {"error": str(last_exc) if last_exc else None})
@@ -1102,7 +1104,8 @@ class AgentSystem:
             metadata.pop("claim_expires_at", None)
             metadata.pop("claim_heartbeat_at", None)
         else:
-            existing_token = metadata.get("claim_token") if metadata.get("claimed_by") == claimed_by else None
+            current_claimed_by = metadata.get("claimed_by")
+            existing_token = metadata.get("claim_token") if current_claimed_by == claimed_by else None
             metadata["claimed_by"] = claimed_by
             metadata["claim_token"] = existing_token if isinstance(existing_token, str) and existing_token else str(uuid.uuid4())
             metadata["claim_heartbeat_at"] = now.isoformat()
