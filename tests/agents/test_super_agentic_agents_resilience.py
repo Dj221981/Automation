@@ -5,7 +5,7 @@ from src.agents.task_store import InMemoryTaskStore
 def _make_failing_agent(name: str) -> ExecutorAgent:
     agent = ExecutorAgent(name)
 
-    def boom(_decision):
+    def boom(_):
         raise RuntimeError("boom")
 
     agent.act = boom  # type: ignore[assignment]

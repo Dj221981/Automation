@@ -1002,7 +1002,8 @@ class AgentSystem:
 
     def _calculate_retry_delay(self, attempts: int) -> int:
         bounded_attempts = max(1, int(attempts))
-        delay = self.retry_backoff_base_seconds * (2 ** (bounded_attempts - 1))
+        capped_exponent = min(bounded_attempts - 1, 10)
+        delay = self.retry_backoff_base_seconds * (2 ** capped_exponent)
         return min(delay, self.retry_backoff_max_seconds)
 
     def _ensure_claimed_by(self, task: Task, agent_id: str) -> None:
