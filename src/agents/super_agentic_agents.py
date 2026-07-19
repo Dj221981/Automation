@@ -1065,8 +1065,8 @@ class AgentSystem:
                     self.persistence_backoff_max_seconds,
                     self.persistence_backoff_min_seconds * (2**exponent),
                 )
-                normalized_offset = (self._retry_random.random() - 0.5) * 2
-                jitter = base_delay * self.persistence_backoff_jitter_ratio * normalized_offset
+                jitter_factor = (self._retry_random.random() - 0.5) * 2
+                jitter = base_delay * self.persistence_backoff_jitter_ratio * jitter_factor
                 time.sleep(min(self.persistence_backoff_max_seconds, max(0.0, base_delay + jitter)))
 
         self.system_metrics["persistence_failures"] += 1
