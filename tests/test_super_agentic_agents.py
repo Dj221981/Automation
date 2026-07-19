@@ -574,3 +574,49 @@ def test_from_stored_task_unknown_status_falls_back_to_pending():
 
     task = system._from_stored_task(legacy_stored)
     assert task.status == TaskStatus.PENDING
+
+
+# ---------------------------------------------------------------------------
+# New tests: list_persisted_tasks status filter
+# ---------------------------------------------------------------------------
+
+
+def test_list_persisted_tasks_filters_by_status():
+    """list_persisted_tasks(status=...) should return only tasks with the given status."""
+    store = InMemoryTaskStore()
+    system = AgentSystem("FilterSystem", task_store=store)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    pending_task = system.create_task("Pending task", {"value": 1})
+    assigned_task = system.create_task("Assigned task", {"value": 2})
+    assert system.submit_task(assigned_task, agent.id) is True
+
+    pending_tasks = system.list_persisted_tasks(status=TaskStatus.PENDING)
+    assigned_tasks = system.list_persisted_tasks(status=TaskStatus.ASSIGNED)
+
+    assert any(t.id == pending_task.id for t in pending_tasks)
+    assert all(t.id != assigned_task.id for t in pending_tasks)
+    assert any(t.id == assigned_task.id for t in assigned_tasks)
+    assert all(t.id != pending_task.id for t in assigned_tasks)
+
+
+# ---------------------------------------------------------------------------
+# New tests: agent memory store and retrieve
+# ---------------------------------------------------------------------------
+
+
+def test_agent_memory_store_and_retrieve():
+    """AgentMemory should store episodic and semantic entries and retrieve them correctly."""
+    from src.agents.super_agentic_agents import AgentMemory
+
+    mem = AgentMemory(agent_id="test-agent")
+
+    mem.store_episode("ep1", {"data": "hello"})
+    mem.store_semantic("sem1", {"fact": "world"})
+
+    assert mem.retrieve("ep1", memory_type="episodic") == {"data": "hello"}
+    assert mem.retrieve("sem1", memory_type="semantic") == {"fact": "world"}
+    assert mem.retrieve("ep1") == {"data": "hello"}
+    assert mem.retrieve("sem1") == {"fact": "world"}
+    assert mem.retrieve("nonexistent") is None
