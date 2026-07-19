@@ -1,3 +1,5 @@
+import pytest
+
 from src.agents.super_agentic_agents import AgentSystem, ExecutorAgent, TaskStatus
 from src.agents.task_store import InMemoryTaskStore
 
@@ -18,7 +20,7 @@ def test_failed_task_tracks_retry_metadata():
 
     try:
         system.execute_task(task.id, agent.id)
-        assert False, "Expected RuntimeError"
+        pytest.fail("Expected RuntimeError")
     except RuntimeError as exc:
         assert str(exc) == "boom"
 
@@ -47,7 +49,7 @@ def test_max_retries_moves_task_to_dead_letter():
     for attempt in range(2):
         try:
             system.execute_task(task.id, agent.id)
-            assert False, "Expected RuntimeError"
+            pytest.fail("Expected RuntimeError")
         except RuntimeError as exc:
             assert str(exc) == "boom"
         if attempt == 0:

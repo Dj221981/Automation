@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from .task_store import InMemoryTaskStore, StoredTask, TaskStore
 
 logger = logging.getLogger(__name__)
+MAX_RETRY_EXPONENT = 10
 
 
 class AgentRole(Enum):
@@ -1032,7 +1033,7 @@ class AgentSystem:
         `retry_backoff_max_seconds`.
         """
         bounded_attempts = max(1, int(attempts))
-        capped_exponent = min(bounded_attempts - 1, 10)
+        capped_exponent = min(bounded_attempts - 1, MAX_RETRY_EXPONENT)
         delay = self.retry_backoff_base_seconds * (2 ** capped_exponent)
         return min(delay, self.retry_backoff_max_seconds)
 
@@ -1085,9 +1086,10 @@ class AgentSystem:
             raise OverflowError(f"Task queue full ({self.max_queue_size})")
         generation = self._queue_generations.get(task.id, 0) + 1
         self._queue_generations[task.id] = generation
+        queue_priority = -int(task.priority.value)
         heapq.heappush(
             self._global_task_queue,
-            TaskQueueEntry(-int(task.priority.value), task.created_at.timestamp(), task.id, generation=generation),
+            TaskQueueEntry(queue_priority, task.created_at.timestamp(), task.id, generation=generation),
         )
         self._task_index.add(task.id)
         self._compact_queue_if_needed()
