@@ -1,0 +1,12 @@
+.git
+node_modules
+dist
+__pycache__
+*.pyc
+*.pyo
+.env
+logs/
+checkpoints/
+tests/
+*.md
+.github/
