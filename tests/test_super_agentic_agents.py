@@ -650,3 +650,125 @@ def test_agent_factory_creates_agents_and_team():
     system = AgentFactory.create_team({"executor": 2, "analyzer": 1})
     # +1 for the built-in orchestrator that AgentSystem always creates.
     assert len(system.agents) == 4
+
+
+# ---------------------------------------------------------------------------
+# New tests: AgentCapability validation
+# ---------------------------------------------------------------------------
+
+
+def test_agent_capability_validation_rejects_invalid_inputs():
+    """AgentCapability should raise ValueError for blank name/description or out-of-range score."""
+    from src.agents.super_agentic_agents import AgentCapability
+
+    try:
+        AgentCapability(name="  ", description="valid")
+        assert False, "Expected ValueError for blank name"
+    except ValueError as exc:
+        assert "name" in str(exc).lower()
+
+    try:
+        AgentCapability(name="cap", description="   ")
+        assert False, "Expected ValueError for blank description"
+    except ValueError as exc:
+        assert "description" in str(exc).lower()
+
+    try:
+        AgentCapability(name="cap", description="valid", confidence_score=1.5)
+        assert False, "Expected ValueError for confidence_score > 1.0"
+    except ValueError as exc:
+        assert "confidence_score" in str(exc).lower()
+
+    try:
+        AgentCapability(name="cap", description="valid", confidence_score=-0.1)
+        assert False, "Expected ValueError for confidence_score < 0.0"
+    except ValueError as exc:
+        assert "confidence_score" in str(exc).lower()
+
+    # Valid capability should not raise.
+    cap = AgentCapability(name="file_processing", description="Process files", confidence_score=0.9)
+    assert "file_processing" in repr(cap)
+
+
+# ---------------------------------------------------------------------------
+# New tests: register_capability duplicate and max-cap guards
+# ---------------------------------------------------------------------------
+
+
+def test_register_capability_duplicate_and_max_cap():
+    """register_capability should return False for duplicates and when the cap limit is reached."""
+    from src.agents.super_agentic_agents import AgentCapability
+
+    agent = ExecutorAgent("CapAgent")
+
+    cap = AgentCapability(name="search", description="Search data")
+    assert agent.register_capability(cap) is True
+    # Duplicate registration should be rejected.
+    assert agent.register_capability(cap) is False
+    assert agent.list_capabilities() == ["search"]
+
+    # Fill to max (max_capabilities=50 by default; use a tiny agent to avoid 50 iterations).
+    tight_agent = ExecutorAgent.__new__(ExecutorAgent)
+    tight_agent.__init__.__func__(tight_agent, "TightAgent")  # noqa: E501 - call __init__ normally
+    tight_agent.max_capabilities = 1
+    cap_a = AgentCapability(name="alpha", description="First cap")
+    cap_b = AgentCapability(name="beta", description="Second cap — exceeds limit")
+    assert tight_agent.register_capability(cap_a) is True
+    assert tight_agent.register_capability(cap_b) is False
+
+
+# ---------------------------------------------------------------------------
+# New tests: LearnerAgent.learn_from_experience
+# ---------------------------------------------------------------------------
+
+
+def test_learner_agent_learn_from_experience():
+    """LearnerAgent.learn_from_experience should store a new pattern and record it in memory."""
+    from src.agents.super_agentic_agents import LearnerAgent
+
+    learner = LearnerAgent("Learner-Test")
+    assert len(learner.learned_patterns) == 0
+
+    experience = {"observation": "task succeeded", "context": {"retries": 0}}
+    learner.learn_from_experience(experience)
+
+    assert len(learner.learned_patterns) == 1
+    pattern = next(iter(learner.learned_patterns.values()))
+    assert pattern["experience"]["observation"] == "task succeeded"
+    assert pattern["confidence"] == 0.5
+    assert "learned_at" in pattern
+
+    # A second experience creates a distinct pattern.
+    learner.learn_from_experience({"observation": "task failed"})
+    assert len(learner.learned_patterns) == 2
+
+
+# ---------------------------------------------------------------------------
+# New tests: AgentSystem.get_system_status and to_json
+# ---------------------------------------------------------------------------
+
+
+def test_agent_system_get_status_and_to_json():
+    """get_system_status should return a dict with expected keys; to_json should produce valid JSON."""
+    import json
+
+    store = InMemoryTaskStore()
+    system = AgentSystem("StatusSystem", task_store=store)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Status task", {"value": 42})
+    assert system.submit_task(task, agent.id) is True
+    system.execute_task(task.id, agent.id)
+
+    status = system.get_system_status()
+    assert status["system_name"] == "StatusSystem"
+    assert "system_id" in status
+    assert "agents" in status
+    assert "metrics" in status
+    assert status["metrics"]["successful_tasks"] == 1
+    assert status["metrics"]["failed_tasks"] == 0
+
+    raw = system.to_json()
+    parsed = json.loads(raw)
+    assert parsed["system_name"] == "StatusSystem"
