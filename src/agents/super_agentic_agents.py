@@ -33,6 +33,9 @@ from .task_store import InMemoryTaskStore, StoredTask, TaskStore
 
 logger = logging.getLogger(__name__)
 
+# Initial delay (seconds) for persistence retry backoff. Doubles each attempt up to
+# AgentSystem.max_persistence_backoff_seconds.
+_INITIAL_PERSISTENCE_RETRY_DELAY: float = 0.05
 
 class AgentRole(Enum):
     """Defines the role/purpose of an agent."""
@@ -269,6 +272,14 @@ class BaseAgent(ABC):
             return True
 
     def run_task(self, task: Task, timeout_seconds: Optional[float] = None) -> Any:
+        """Execute a task synchronously.
+
+        The ``timeout_seconds`` parameter is a *post-execution* duration guard: it
+        allows the task to complete naturally and then raises ``TimeoutError`` if the
+        elapsed time exceeded the limit.  This keeps the module fully synchronous and
+        avoids the complexity of thread-based interruption.  For true preemptive
+        cancellation, callers should manage task execution in a dedicated thread.
+        """
         with self._lock:
             if task.id not in self.active_tasks:
                 raise ValueError(f"Task {task.id} must be assigned before execution")
@@ -774,7 +785,7 @@ class AgentSystem:
         self.task_store.create_task(self._to_stored_task(task))
 
     def _update_task_record(self, task: Task) -> None:
-        delay = 0.05
+        delay = _INITIAL_PERSISTENCE_RETRY_DELAY
         last_exc: Optional[Exception] = None
         for attempt in range(3):
             try:

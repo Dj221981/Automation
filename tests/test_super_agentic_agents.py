@@ -332,7 +332,7 @@ def test_concurrent_submit_only_one_succeeds():
 
 def test_submit_task_sets_lease_metadata():
     """When default_lease_seconds is set, submitted tasks should carry lease metadata."""
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     store = InMemoryTaskStore()
     system = AgentSystem("LeaseSystem", task_store=store, default_lease_seconds=60.0)
@@ -350,12 +350,13 @@ def test_submit_task_sets_lease_metadata():
     lease_str = stored.metadata.get("lease_expires_at")
     assert lease_str is not None
     lease_dt = datetime.fromisoformat(lease_str)
-    assert lease_dt > datetime.now()
+    # Use a tolerance: lease should be at least 55s in the future (generous buffer for CI).
+    assert lease_dt >= datetime.now() + timedelta(seconds=55)
 
 
 def test_heartbeat_task_refreshes_lease():
     """heartbeat_task should update heartbeat_at and extend lease_expires_at."""
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     store = InMemoryTaskStore()
     system = AgentSystem("HeartbeatSystem", task_store=store, default_lease_seconds=5.0)
@@ -375,7 +376,8 @@ def test_heartbeat_task_refreshes_lease():
     hb_after = stored_after.metadata.get("heartbeat_at")
     assert hb_after != hb_before
     lease_after = datetime.fromisoformat(stored_after.metadata["lease_expires_at"])
-    assert lease_after > datetime.now()
+    # Lease should be at least 4s in the future (generous buffer for CI on a 5s lease).
+    assert lease_after >= datetime.now() + timedelta(seconds=4)
 
 
 def test_heartbeat_task_wrong_agent_raises():
