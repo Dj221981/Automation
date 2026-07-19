@@ -740,14 +740,8 @@ class AgentSystem:
             with self._lock:
                 # Increment attempt counter before persisting FAILED status so the
                 # value is stored and visible via observability / dead-letter events.
-                attempts = int(task.metadata.get("attempts", 0)) + 1 if isinstance(task.metadata, dict) else 1
-                max_attempts = (
-                    int(task.metadata.get("max_attempts", self.max_retries_per_task))
-                    if isinstance(task.metadata, dict)
-                    else self.max_retries_per_task
-                )
-                if isinstance(task.metadata, dict):
-                    task.metadata["attempts"] = attempts
+                attempts = self._increment_task_attempts(task)
+                max_attempts = self._get_task_max_attempts(task)
                 self._set_task_status(
                     task,
                     TaskStatus.FAILED,
@@ -1023,12 +1017,29 @@ class AgentSystem:
     def _dequeue_task(self, task_id: str) -> None:
         if task_id in self._task_index:
             self._task_index.discard(task_id)
+            # Rebuild the heap after removal. This is O(n) but keeps
+            # global_task_queue consistent so callers can iterate it directly.
+            # For very large queues a lazy-deletion approach would be preferable.
             self.global_task_queue = [e for e in self.global_task_queue if e.id != task_id]
             heapq.heapify(self.global_task_queue)
 
     def _append_unique_task(self, collection: List[Task], task: Task) -> None:
         if not any(existing.id == task.id for existing in collection):
             collection.append(task)
+
+    def _get_task_max_attempts(self, task: Task) -> int:
+        """Return max_attempts from task metadata, falling back to the system default."""
+        if isinstance(task.metadata, dict):
+            return int(task.metadata.get("max_attempts", self.max_retries_per_task))
+        return self.max_retries_per_task
+
+    def _increment_task_attempts(self, task: Task) -> int:
+        """Increment the attempts counter in task metadata and return the new value."""
+        current = int(task.metadata.get("attempts", 0)) if isinstance(task.metadata, dict) else 0
+        new_value = current + 1
+        if isinstance(task.metadata, dict):
+            task.metadata["attempts"] = new_value
+        return new_value
 
     def _update_system_metrics(self, success: bool, start_time: datetime) -> None:
         elapsed = (datetime.now() - start_time).total_seconds()
