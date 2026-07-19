@@ -7,6 +7,7 @@ from src.agents.super_agentic_agents import (
     AgentCapability,
     AgentSystem,
     ExecutorAgent,
+    Task,
     TaskPriority,
     TaskStatus,
 )
@@ -88,3 +89,89 @@ def test_queue_overflow_raises():
 
     with pytest.raises(OverflowError, match="Task queue full"):
         system.create_task("two", {})
+
+
+def test_retry_delay_caps_exponent_and_max_delay():
+    system = AgentSystem("test")
+    system.retry_backoff_base_seconds = 5
+    system.retry_backoff_max_seconds = 10_000
+
+    assert system._calculate_retry_delay(1) == 5
+    assert system._calculate_retry_delay(2) == 10
+    assert system._calculate_retry_delay(25) == 5 * (2**10)
+
+    system.retry_backoff_max_seconds = 120
+    assert system._calculate_retry_delay(25) == 120
+
+
+def test_sync_task_copies_state_without_sharing_references():
+    system = AgentSystem("test")
+    source = Task(
+        description="source",
+        priority=TaskPriority.HIGH,
+        assigned_to="agent-1",
+        status=TaskStatus.FAILED,
+        result={"nested": {"ok": True}},
+        error="boom",
+        parameters={"payload": {"value": 1}},
+        dependencies=["dep-1"],
+        metadata={"retry": {"count": 2}},
+    )
+    target = Task(description="target", parameters={"old": True})
+
+    system._sync_task(target, source)
+
+    assert target.description == source.description
+    assert target.priority == source.priority
+    assert target.assigned_to == source.assigned_to
+    assert target.status == source.status
+    assert target.result == source.result
+    assert target.error == source.error
+    assert target.parameters == source.parameters
+    assert target.dependencies == source.dependencies
+    assert target.metadata == source.metadata
+
+    source.result["nested"]["ok"] = False
+    source.parameters["payload"]["value"] = 99
+    source.dependencies.append("dep-2")
+    source.metadata["retry"]["count"] = 3
+
+    assert target.result["nested"]["ok"] is True
+    assert target.parameters["payload"]["value"] == 1
+    assert target.dependencies == ["dep-1"]
+    assert target.metadata["retry"]["count"] == 2
+
+
+def test_retry_backlog_increments_and_clears_on_manual_requeue():
+    class FailingExecutorAgent(ExecutorAgent):
+        def act(self, _decision):
+            raise RuntimeError("boom")
+
+    system = AgentSystem("test")
+    agent = FailingExecutorAgent("worker")
+    assert system.add_agent(agent)
+
+    task = system.create_task("retry", {})
+    assert system.submit_task(task, agent.id)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        system.execute_task(task.id, agent.id)
+
+    assert system.get_observability_snapshot()["retry_backlog"] == 1
+
+    system.requeue_task(task.id)
+    assert system.get_observability_snapshot()["retry_backlog"] == 0
+
+
+def test_queue_compaction_discards_stale_entries():
+    system = AgentSystem("test")
+    system.max_queue_size = 1
+    task = system.create_task("compact-me", {})
+
+    for _ in range(4):
+        system._dequeue_task(task.id)
+        system._enqueue_if_missing(task)
+
+    assert len(system._global_task_queue) == 1
+    assert len(system.global_task_queue) == 1
+    assert system.global_task_queue[0].id == task.id

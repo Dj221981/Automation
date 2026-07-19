@@ -189,7 +189,7 @@ class Task:
 class TaskQueueEntry:
     sort_priority: int
     created_at_ts: float
-    id: str = field(compare=True)
+    id: str = field(compare=False)
     generation: int = field(compare=False, default=0)
 
 
