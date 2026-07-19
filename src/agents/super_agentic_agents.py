@@ -189,6 +189,7 @@ class TaskQueueEntry:
     sort_priority: int
     created_at_ts: float
     id: str = field(compare=True)
+    generation: int = field(compare=False, default=0)
 
 
 class BaseAgent(ABC):
@@ -572,9 +573,11 @@ class AgentSystem:
         self.orchestrator = OrchestratorAgent(f"{name}-Orchestrator")
         self.agents: Dict[str, BaseAgent] = {self.orchestrator.id: self.orchestrator}
         self.max_queue_size = 10000
-        self.global_task_queue: List[TaskQueueEntry] = []
+        self._global_task_queue: List[TaskQueueEntry] = []
+        self._queue_generations: Dict[str, int] = {}
         self._task_index: Set[str] = set()
         self.dead_letter_queue: deque[Dict[str, Any]] = deque(maxlen=2000)
+        self._retry_backlog = 0
         self.max_retries_per_task = 3
         self.completed_tasks: List[Task] = []
         self.failed_tasks: List[Task] = []
@@ -744,6 +747,7 @@ class AgentSystem:
                 now = datetime.now()
                 if not isinstance(task.metadata, dict):
                     task.metadata = {}
+                had_retry = bool(task.metadata.get("next_retry_at"))
                 attempts = int(task.metadata.get("attempts", 0)) + 1
                 task.metadata["attempts"] = attempts
                 max_attempts = int(task.metadata.get("max_attempts", self.max_retries_per_task))
@@ -752,12 +756,14 @@ class AgentSystem:
                     task.metadata["dead_letter_reason"] = str(exc)
                     task.metadata.pop("next_retry_at", None)
                     task.metadata.pop("retry_backoff_seconds", None)
+                    self._update_retry_backlog(had_retry, False)
                 else:
                     retry_delay = self._calculate_retry_delay(attempts)
                     task.metadata["retry_backoff_seconds"] = retry_delay
                     task.metadata["next_retry_at"] = datetime.fromtimestamp(now.timestamp() + retry_delay).isoformat()
                     task.metadata.pop("dead_lettered_at", None)
                     task.metadata.pop("dead_letter_reason", None)
+                    self._update_retry_backlog(had_retry, True)
                 self._set_task_status(
                     task,
                     TaskStatus.FAILED,
@@ -843,6 +849,7 @@ class AgentSystem:
                     working_task.result = None
                     working_task.error = None
                     working_task.completed_at = None
+                    self._clear_retry_metadata(working_task)
                     self._set_task_status(working_task, TaskStatus.PENDING, assigned_to=None, claimed_by=None)
                     self._enqueue_if_missing(working_task)
                     self._emit_event("task_recovered", working_task)
@@ -861,6 +868,7 @@ class AgentSystem:
 
             original_assigned_to = task.assigned_to
             self._release_task_from_agent(task.id, original_assigned_to)
+            self._clear_retry_metadata(task)
             self._set_task_status(
                 task,
                 TaskStatus.PENDING,
@@ -987,6 +995,16 @@ class AgentSystem:
             task.metadata["claim_heartbeat_at"] = now.isoformat()
             task.metadata["claim_expires_at"] = datetime.fromtimestamp(now.timestamp() + self.claim_ttl_seconds).isoformat()
 
+    def _clear_retry_metadata(self, task: Task) -> None:
+        if not isinstance(task.metadata, dict):
+            task.metadata = {}
+        had_retry = bool(task.metadata.get("next_retry_at"))
+        task.metadata.pop("next_retry_at", None)
+        task.metadata.pop("retry_backoff_seconds", None)
+        task.metadata.pop("dead_lettered_at", None)
+        task.metadata.pop("dead_letter_reason", None)
+        self._update_retry_backlog(had_retry, False)
+
     def _sync_task(self, target: Task, source: Task) -> None:
         target.description = source.description
         target.priority = source.priority
@@ -1001,10 +1019,23 @@ class AgentSystem:
         target.metadata = copy.deepcopy(source.metadata)
 
     def _calculate_retry_delay(self, attempts: int) -> int:
+        """Return exponential retry backoff in seconds.
+
+        The delay starts at `retry_backoff_base_seconds` and doubles for each
+        additional attempt. The exponent is capped to avoid unbounded integer
+        growth for pathological retry counts, and the final value is clamped to
+        `retry_backoff_max_seconds`.
+        """
         bounded_attempts = max(1, int(attempts))
         capped_exponent = min(bounded_attempts - 1, 10)
         delay = self.retry_backoff_base_seconds * (2 ** capped_exponent)
         return min(delay, self.retry_backoff_max_seconds)
+
+    def _update_retry_backlog(self, previous: bool, current: bool) -> None:
+        if current and not previous:
+            self._retry_backlog += 1
+        elif not current and previous and self._retry_backlog > 0:
+            self._retry_backlog -= 1
 
     def _ensure_claimed_by(self, task: Task, agent_id: str) -> None:
         claimed_by = task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None
@@ -1042,14 +1073,31 @@ class AgentSystem:
             return
         if len(self._task_index) >= self.max_queue_size:
             raise OverflowError(f"Task queue full ({self.max_queue_size})")
-        heapq.heappush(self.global_task_queue, TaskQueueEntry(-int(task.priority.value), task.created_at.timestamp(), task.id))
+        generation = self._queue_generations.get(task.id, 0) + 1
+        self._queue_generations[task.id] = generation
+        heapq.heappush(
+            self._global_task_queue,
+            TaskQueueEntry(-int(task.priority.value), task.created_at.timestamp(), task.id, generation=generation),
+        )
         self._task_index.add(task.id)
+        self._compact_queue_if_needed()
 
     def _dequeue_task(self, task_id: str) -> None:
         if task_id in self._task_index:
             self._task_index.remove(task_id)
-            self.global_task_queue = [entry for entry in self.global_task_queue if entry.id != task_id]
-            heapq.heapify(self.global_task_queue)
+
+    def _is_queue_entry_live(self, entry: TaskQueueEntry) -> bool:
+        return entry.id in self._task_index and entry.generation == self._queue_generations.get(entry.id)
+
+    def _compact_queue_if_needed(self) -> None:
+        if len(self._global_task_queue) <= (self.max_queue_size * 2):
+            return
+        self._global_task_queue = [entry for entry in self._global_task_queue if self._is_queue_entry_live(entry)]
+        heapq.heapify(self._global_task_queue)
+
+    @property
+    def global_task_queue(self) -> List[TaskQueueEntry]:
+        return [entry for entry in self._global_task_queue if self._is_queue_entry_live(entry)]
 
     def _append_unique_task(self, collection: List[Task], task: Task) -> None:
         if not any(existing.id == task.id for existing in collection):
@@ -1087,16 +1135,12 @@ class AgentSystem:
             }
 
     def get_observability_snapshot(self) -> Dict[str, Any]:
-        retry_backlog = 0
-        for task in self.list_persisted_tasks(TaskStatus.FAILED):
-            if task.metadata.get("next_retry_at"):
-                retry_backlog += 1
         return {
             "metrics": _make_json_safe(self.system_metrics),
             "recent_events": self.event_log[-200:],
             "queue_depth": len(self._task_index),
             "dead_letter_depth": len(self.dead_letter_queue),
-            "retry_backlog": retry_backlog,
+            "retry_backlog": self._retry_backlog,
             "queue_limit": self.max_queue_size,
             "retry_backoff_base_seconds": self.retry_backoff_base_seconds,
             "retry_backoff_max_seconds": self.retry_backoff_max_seconds,

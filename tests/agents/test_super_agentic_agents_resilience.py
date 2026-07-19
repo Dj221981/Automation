@@ -2,20 +2,15 @@ from src.agents.super_agentic_agents import AgentSystem, ExecutorAgent, TaskStat
 from src.agents.task_store import InMemoryTaskStore
 
 
-def _make_failing_agent(name: str) -> ExecutorAgent:
-    agent = ExecutorAgent(name)
-
-    def boom(_):
+class FailingExecutorAgent(ExecutorAgent):
+    def act(self, _):
         raise RuntimeError("boom")
-
-    agent.act = boom  # type: ignore[assignment]
-    return agent
 
 
 def test_failed_execution_tracks_retry_metadata_without_auto_requeue():
     store = InMemoryTaskStore()
     system = AgentSystem("retry-metadata", task_store=store)
-    agent = _make_failing_agent("worker")
+    agent = FailingExecutorAgent("worker")
     assert system.add_agent(agent)
 
     task = system.create_task("job", {})
@@ -43,7 +38,7 @@ def test_manual_requeue_then_second_failure_moves_task_to_dead_letter():
     store = InMemoryTaskStore()
     system = AgentSystem("dead-letter", task_store=store)
     system.max_retries_per_task = 2
-    agent = _make_failing_agent("worker")
+    agent = FailingExecutorAgent("worker")
     assert system.add_agent(agent)
 
     task = system.create_task("job", {})
