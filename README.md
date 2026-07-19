@@ -1,64 +1,53 @@
-# Hey there! 👋
+# Automation
 
-Welcome to my GitHub profile! I'm a **Full-Stack Developer** passionate about creating innovative solutions across the web, cloud infrastructure, and game development. Currently building **Ai-morphasis 2.0**, an ambitious AI-driven project pushing the boundaries of what's possible.
+![CI](https://github.com/Dj221981/Automation/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Coverage](https://img.shields.io/badge/coverage-CodeCov-orange)
 
-## 🚀 About Me
+Automation is a hybrid Python/TypeScript automation platform with a DQN reinforcement-learning core and super-agentic orchestration components designed for production deployment.
 
-I thrive on solving complex problems and building scalable, production-grade applications. With a balanced approach to technical excellence and creative problem-solving, I'm driven by the challenge of bringing ideas to life through code.
+## Quick Start
 
-- 🔭 **Currently creating** Ai-morphasis 2.0 — a sophisticated AI system with evolving capabilities
-- 🌱 **Always learning** new architectures, frameworks, and best practices
-- 💡 **Interested in** Full-Stack Development, Cloud Infrastructure, Game Dev, and AI/ML applications
-- 🎮 **Passionate about** building engaging experiences across platforms
-- 💬 **Ask me about** scalable architecture, cloud solutions, game mechanics, or AI implementation
-- 📫 **Let's connect** — reach out via email or social media!
+```bash
+git clone https://github.com/Dj221981/Automation.git
+cd Automation
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+pytest tests/ -v --cov=src
+```
 
-## 💻 Tech Stack
+## Project Structure
 
-- **Languages**: Python, JavaScript/TypeScript, and more
-- **Full-Stack**: Frontend UI → Backend APIs → Database Design
-- **Cloud & Infrastructure**: Deploying and scaling applications in the cloud
-- **Game Development**: Building interactive experiences
-- **AI/ML**: Implementing intelligent systems and algorithms
-- **DevOps & Testing**: GitHub Actions (CI/CD), Docker, pytest, flake8, code coverage tracking
+| Path | Purpose |
+| --- | --- |
+| `src/` | Python application logic, DQN model, training and agent orchestration |
+| `tests/` | Python and TypeScript test suites |
+| `config/production.json` | Production configuration defaults |
+| `storage/` | TypeScript storage-related modules and assets |
+| `.github/workflows/ci.yml` | CI pipeline for Python and TypeScript validation |
 
-## 🎯 Featured Work
+## Configuration
 
-- **[Ai-morphasis 2.0](https://github.com/Dj221981/Ai-morphasis-2.0-2)** — A cutting-edge AI system with comprehensive testing, advanced CI/CD pipelines, and multi-version Python support. Features professional-grade linting, code coverage tracking, and specialized DeepMind tool integration.
+- Use `config/production.json` as the production baseline.
+- Copy `.env.example` to `.env` and override environment-specific values.
+- Keep secrets out of source control and inject them via environment variables.
 
-## 📊 GitHub Activity
+## Docker
 
-![GitHub Stats](https://github-readme-stats.vercel.app/api?username=Dj221981&show_icons=true&theme=dark)
+```bash
+docker build -t automation:latest .
+docker compose up --build
+```
 
-![Top Languages](https://github-readme-stats.vercel.app/api/top-langs/?username=Dj221981&layout=compact&theme=dark)
+The compose stack includes the main app container and a TensorBoard service on `http://localhost:6006`.
 
-## 🤝 Connect With Me
+## Contributing
 
-Let's collaborate, discuss tech, or just chat!
+Please follow `DEVELOPMENT.md` for setup, coding standards, and contribution workflow.
 
-- **Email**: [darrenjris24@gmail.com](mailto:darrenjris24@gmail.com)
-- **Facebook**: [Connect on Facebook](#)
-- **YouTube**: [Subscribe on YouTube](#)
-- **LinkedIn**: [Connect on LinkedIn](#)
+## License
 
-## 🎮 Current Focus
-
-Working on expanding **Ai-morphasis 2.0** with:
-- Enhanced AI capabilities and system architecture
-- Cloud infrastructure optimization
-- Integration with modern frameworks and tools
-- Comprehensive testing and deployment pipelines
-- Game development integrations
-
-## 📝 My Approach
-
-I believe in writing clean, maintainable code with solid testing practices. You'll notice my projects emphasize:
-- ✅ Comprehensive test coverage
-- 🔄 Automated CI/CD pipelines
-- 📦 Professional code quality standards
-- 🚀 Scalable architecture
-- 🎯 Production-ready deployments
-
----
-
-⭐ **If you find my work interesting, feel free to star a repo or reach out to collaborate!**
+This project is licensed under the MIT License.
