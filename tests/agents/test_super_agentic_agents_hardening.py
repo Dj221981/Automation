@@ -66,6 +66,20 @@ def test_reclaim_expired_claims_requeues_task():
     assert system.system_metrics["claim_reclaims"] == 1
 
 
+def test_reclaim_expired_claims_accepts_timezone_aware_timestamps():
+    system = AgentSystem("claims-tz")
+    agent = ExecutorAgent("worker")
+    assert system.add_agent(agent)
+
+    task = system.create_task("expiring-aware", {})
+    assert system.submit_task(task, agent.id) is True
+
+    task.metadata["claim_expires_at"] = "2000-01-01T00:00:00+00:00"
+
+    assert system.reclaim_expired_claims() == 1
+    assert task.status == TaskStatus.PENDING
+
+
 def test_worker_loop_processes_pending_tasks():
     system = AgentSystem("workers")
     agent = ExecutorAgent("worker")

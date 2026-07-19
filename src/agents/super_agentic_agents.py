@@ -28,7 +28,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -665,9 +665,12 @@ class AgentSystem:
         if not isinstance(raw, str) or not raw:
             return None
         try:
-            return datetime.fromisoformat(raw)
+            parsed = datetime.fromisoformat(raw)
         except ValueError:
             return None
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
 
     def _synchronize_task(self, target: Task, source: Task) -> Task:
         target.description = source.description
@@ -1062,8 +1065,8 @@ class AgentSystem:
                     self.persistence_backoff_max_seconds,
                     self.persistence_backoff_min_seconds * (2**exponent),
                 )
-                jitter_multiplier = (self._retry_random.random() - 0.5) * 2
-                jitter = base_delay * self.persistence_backoff_jitter_ratio * jitter_multiplier
+                normalized_jitter = (self._retry_random.random() - 0.5) * 2
+                jitter = base_delay * self.persistence_backoff_jitter_ratio * normalized_jitter
                 time.sleep(min(self.persistence_backoff_max_seconds, max(0.0, base_delay + jitter)))
 
         self.system_metrics["persistence_failures"] += 1
