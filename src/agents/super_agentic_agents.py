@@ -766,7 +766,13 @@ class AgentSystem:
         with self._lock:
             safe_parameters = copy.deepcopy(parameters) if isinstance(parameters, dict) else {}
             safe_metadata = copy.deepcopy(metadata) if isinstance(metadata, dict) else {}
-            safe_dependencies = list(dependencies) if dependencies is not None else list(safe_parameters.get("dependencies", []))
+            parameter_dependencies = safe_parameters.get("dependencies", [])
+            if dependencies is not None:
+                safe_dependencies = list(dependencies)
+            elif isinstance(parameter_dependencies, list):
+                safe_dependencies = list(parameter_dependencies)
+            else:
+                safe_dependencies = []
             idempotency_key = self._extract_idempotency_key(safe_parameters, safe_metadata)
             if idempotency_key:
                 existing = self._find_task_by_idempotency_key(idempotency_key)
@@ -1056,7 +1062,7 @@ class AgentSystem:
                     self.persistence_backoff_max_seconds,
                     self.persistence_backoff_min_seconds * (2**exponent),
                 )
-                jitter_multiplier = (self._retry_random.random() * 2) - 1
+                jitter_multiplier = (self._retry_random.random() - 0.5) * 2
                 jitter = base_delay * self.persistence_backoff_jitter_ratio * jitter_multiplier
                 time.sleep(min(self.persistence_backoff_max_seconds, max(0.0, base_delay + jitter)))
 
@@ -1106,10 +1112,11 @@ class AgentSystem:
         else:
             current_claimed_by = metadata.get("claimed_by")
             existing_token = metadata.get("claim_token") if current_claimed_by == claimed_by else None
+            expires_at = now + timedelta(seconds=self.claim_ttl_seconds)
             metadata["claimed_by"] = claimed_by
             metadata["claim_token"] = existing_token if isinstance(existing_token, str) and existing_token else str(uuid.uuid4())
             metadata["claim_heartbeat_at"] = now.isoformat()
-            metadata["claim_expires_at"] = (now + timedelta(seconds=self.claim_ttl_seconds)).isoformat()
+            metadata["claim_expires_at"] = expires_at.isoformat()
 
     def _ensure_claimed_by(self, task: Task, agent_id: str) -> None:
         metadata = self._ensure_task_metadata(task)
@@ -1323,17 +1330,17 @@ class AgentSystem:
         """Request worker shutdown and optionally wait for threads to stop."""
         self._stop_event.set()
         self._pause_event.set()
-        wait_timeout = None if timeout_seconds is None else max(timeout_seconds, 0.0)
+        initial_timeout = None if timeout_seconds is None else max(timeout_seconds, 0.0)
         if self._maintenance_thread is not None:
-            self._maintenance_thread.join(wait_timeout)
+            self._maintenance_thread.join(initial_timeout)
             if not self._maintenance_thread.is_alive():
                 self._maintenance_thread = None
-        remaining = wait_timeout
+        remaining = initial_timeout
         for worker in list(self._worker_threads):
             start = time.monotonic()
             worker.join(remaining)
-            if wait_timeout is not None:
-                remaining = max(0.0, wait_timeout - (time.monotonic() - start))
+            if initial_timeout is not None:
+                remaining = max(0.0, initial_timeout - (time.monotonic() - start))
         self._worker_threads = [thread for thread in self._worker_threads if thread.is_alive()]
 
     def pause_processing(self) -> None:
