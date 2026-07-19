@@ -17,6 +17,7 @@ Features:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import time
@@ -161,9 +162,9 @@ class Task:
     def __post_init__(self) -> None:
         if not self.description.strip():
             raise ValueError("Task description cannot be empty")
-        self.parameters = dict(self.parameters)
+        self.parameters = copy.deepcopy(self.parameters)
         self.dependencies = list(self.dependencies)
-        self.metadata = dict(self.metadata)
+        self.metadata = copy.deepcopy(self.metadata)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -684,10 +685,11 @@ class AgentSystem:
             raise ValueError("Only reset_to=TaskStatus.PENDING is supported for recovery")
 
         recovered = 0
-        now = datetime.now()
         with self._lock:
             for status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
                 for task in self.list_persisted_tasks(status):
+                    # Check lease freshness at the point of each task to avoid stale comparisons.
+                    now = datetime.now()
                     # Skip tasks with an active lease (still being worked on).
                     lease_str = task.metadata.get("lease_expires_at") if isinstance(task.metadata, dict) else None
                     if lease_str:
@@ -806,7 +808,8 @@ class AgentSystem:
             task.assigned_to,
             task.status.name,
         )
-        raise last_exc  # type: ignore[misc]
+        assert last_exc is not None
+        raise last_exc
 
     def heartbeat_task(self, task_id: str, agent_id: str) -> None:
         """Refresh the lease for an in-flight task to prevent stale recovery."""

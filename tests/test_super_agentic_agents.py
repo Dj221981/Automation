@@ -460,8 +460,8 @@ def test_timeout_failure_is_persisted():
     """A task that exceeds execution_timeout_seconds should be marked FAILED in the store."""
     store = InMemoryTaskStore()
     # Slow agent sleeps 0.3s; timeout is 0.01s (post-execution check).
-    system = AgentSystem("TimeoutSystem", task_store=store, execution_timeout_seconds=0.01)
-    agent = SlowExecutorAgent("SlowExec", sleep_seconds=0.3)
+    system = AgentSystem("TimeoutSystem", task_store=store, execution_timeout_seconds=0.05)
+    agent = SlowExecutorAgent("SlowExec", sleep_seconds=0.2)
     system.add_agent(agent)
 
     task = system.create_task("Slow task", {"value": 12})
