@@ -620,3 +620,33 @@ def test_agent_memory_store_and_retrieve():
     assert mem.retrieve("ep1") == {"data": "hello"}
     assert mem.retrieve("sem1") == {"fact": "world"}
     assert mem.retrieve("nonexistent") is None
+
+
+# ---------------------------------------------------------------------------
+# New test: AgentFactory creates agents and teams
+# ---------------------------------------------------------------------------
+
+
+def test_agent_factory_creates_agents_and_team():
+    """AgentFactory should create known agent types and assemble a team system."""
+    from src.agents.super_agentic_agents import (
+        AgentFactory,
+        AnalyzerAgent,
+        ExecutorAgent,
+        LearnerAgent,
+        OrchestratorAgent,
+    )
+
+    # create_agent returns correct concrete types for known keys.
+    assert isinstance(AgentFactory.create_agent("executor", "E1"), ExecutorAgent)
+    assert isinstance(AgentFactory.create_agent("analyzer", "A1"), AnalyzerAgent)
+    assert isinstance(AgentFactory.create_agent("learner", "L1"), LearnerAgent)
+    assert isinstance(AgentFactory.create_agent("orchestrator", "O1"), OrchestratorAgent)
+
+    # create_agent returns None for unknown type.
+    assert AgentFactory.create_agent("unknown_type", "X") is None
+
+    # create_team builds a system with the right number of agents.
+    system = AgentFactory.create_team({"executor": 2, "analyzer": 1})
+    # +1 for the built-in orchestrator that AgentSystem always creates.
+    assert len(system.agents) == 4
