@@ -29,11 +29,19 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
 from .task_store import InMemoryTaskStore, StoredTask, TaskStore
 
 logger = logging.getLogger(__name__)
+
+
+class _QueueEntry(NamedTuple):
+    """Priority queue entry that exposes the task id via the `.id` attribute."""
+
+    priority: int
+    tiebreak: float
+    id: str
 
 
 class AgentRole(Enum):
@@ -563,7 +571,7 @@ class AgentSystem:
         self.orchestrator = OrchestratorAgent(f"{name}-Orchestrator")
         self.agents: Dict[str, BaseAgent] = {self.orchestrator.id: self.orchestrator}
         self.max_queue_size = 10000
-        self.global_task_queue: List[tuple[int, float, str]] = []
+        self.global_task_queue: List[_QueueEntry] = []
         self._task_index: Set[str] = set()
         self.dead_letter_queue: deque[Dict[str, Any]] = deque(maxlen=2000)
         self.max_retries_per_task = 3
@@ -672,7 +680,9 @@ class AgentSystem:
         with self._lock:
             persisted = self.load_task(task.id)
             if persisted is not None:
-                task = persisted
+                # Sync the latest persisted state into the caller's task object so
+                # the caller always sees current status after this call returns.
+                self._sync_task_fields(task, persisted)
 
             if task.status != TaskStatus.PENDING:
                 logger.warning("Failed to submit task %s because it is in status %s", task.id, task.status.value)
@@ -728,6 +738,16 @@ class AgentSystem:
             return result
         except Exception as exc:
             with self._lock:
+                # Increment attempt counter before persisting FAILED status so the
+                # value is stored and visible via observability / dead-letter events.
+                attempts = int(task.metadata.get("attempts", 0)) + 1 if isinstance(task.metadata, dict) else 1
+                max_attempts = (
+                    int(task.metadata.get("max_attempts", self.max_retries_per_task))
+                    if isinstance(task.metadata, dict)
+                    else self.max_retries_per_task
+                )
+                if isinstance(task.metadata, dict):
+                    task.metadata["attempts"] = attempts
                 self._set_task_status(
                     task,
                     TaskStatus.FAILED,
@@ -739,14 +759,6 @@ class AgentSystem:
                 )
                 self._append_unique_task(self.failed_tasks, task)
                 self._update_system_metrics(success=False, start_time=start_time)
-                attempts = int(task.metadata.get("attempts", 0)) + 1 if isinstance(task.metadata, dict) else 1
-                if isinstance(task.metadata, dict):
-                    task.metadata["attempts"] = attempts
-                max_attempts = (
-                    int(task.metadata.get("max_attempts", self.max_retries_per_task))
-                    if isinstance(task.metadata, dict)
-                    else self.max_retries_per_task
-                )
                 if attempts >= max_attempts:
                     self.dead_letter_queue.append(
                         {
@@ -756,20 +768,8 @@ class AgentSystem:
                             "attempts": attempts,
                         }
                     )
-                    self._emit_event("task_dead_lettered", task, {"attempts": attempts})
-                else:
-                    self._set_task_status(
-                        task,
-                        TaskStatus.PENDING,
-                        assigned_to=None,
-                        claimed_by=None,
-                        result=None,
-                        error=str(exc),
-                        completed_at=None,
-                    )
-                    self._enqueue_if_missing(task)
-                    self._emit_event("task_requeued", task, {"attempts": attempts})
-                self._emit_event("task_failed", task, {"error": str(exc)})
+                    self._emit_event("task_dead_lettered", task, {"attempts": attempts, "max_attempts": max_attempts})
+                self._emit_event("task_failed", task, {"error": str(exc), "attempts": attempts, "max_attempts": max_attempts})
             raise
 
     def cancel_task(self, task_id: str, reason: Optional[str] = None) -> Task:
@@ -998,17 +998,33 @@ class AgentSystem:
         if agent is not None:
             agent.release_task(task_id)
 
+    def _sync_task_fields(self, target: Task, source: Task) -> None:
+        """Update mutable lifecycle fields of *target* in place from *source*.
+
+        Used to propagate the latest persisted state back into the caller's task
+        reference so that ``task.status``, ``task.metadata``, etc. always reflect
+        reality after a submit / status-change operation.
+        """
+        target.status = source.status
+        target.assigned_to = source.assigned_to
+        target.result = source.result
+        target.error = source.error
+        target.completed_at = source.completed_at
+        target.metadata = source.metadata
+
     def _enqueue_if_missing(self, task: Task) -> None:
         if task.id in self._task_index:
             return
         if len(self._task_index) >= self.max_queue_size:
             raise OverflowError(f"Task queue full ({self.max_queue_size})")
-        heapq.heappush(self.global_task_queue, (-int(task.priority.value), task.created_at.timestamp(), task.id))
+        heapq.heappush(self.global_task_queue, _QueueEntry(-int(task.priority.value), task.created_at.timestamp(), task.id))
         self._task_index.add(task.id)
 
     def _dequeue_task(self, task_id: str) -> None:
         if task_id in self._task_index:
-            self._task_index.remove(task_id)
+            self._task_index.discard(task_id)
+            self.global_task_queue = [e for e in self.global_task_queue if e.id != task_id]
+            heapq.heapify(self.global_task_queue)
 
     def _append_unique_task(self, collection: List[Task], task: Task) -> None:
         if not any(existing.id == task.id for existing in collection):
@@ -1046,12 +1062,13 @@ class AgentSystem:
             }
 
     def get_observability_snapshot(self) -> Dict[str, Any]:
-        return {
-            "metrics": _make_json_safe(self.system_metrics),
-            "recent_events": self.event_log[-200:],
-            "queue_depth": len(self._task_index),
-            "dead_letter_depth": len(self.dead_letter_queue),
-        }
+        with self._lock:
+            return {
+                "metrics": _make_json_safe(self.system_metrics),
+                "recent_events": list(self.event_log[-200:]),
+                "queue_depth": len(self._task_index),
+                "dead_letter_depth": len(self.dead_letter_queue),
+            }
 
     def to_json(self) -> str:
         return json.dumps(self.get_system_status(), indent=2, default=str)

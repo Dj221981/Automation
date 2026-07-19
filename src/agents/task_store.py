@@ -22,7 +22,7 @@ ALLOWED_TASK_TRANSITIONS = {
     "ASSIGNED": {"RUNNING", "PENDING", "CANCELLED"},
     "RUNNING": {"COMPLETED", "FAILED", "CANCELLED", "PENDING"},
     "COMPLETED": set(),
-    "FAILED": set(),
+    "FAILED": {"PENDING"},  # Allow explicit requeue / recovery
     "CANCELLED": set(),
 }
 
