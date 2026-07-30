@@ -136,7 +136,9 @@ class DQNTrainingService:
             )
             return None
 
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.config.batch_size)
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(
+            self.config.batch_size
+        )
         loss = self.model.train_step(states, actions, rewards, next_states, dones)
         self.training_steps += 1
         self.model.decay_epsilon()
@@ -160,7 +162,9 @@ class DQNTrainingService:
         mean_reward: float,
         latest_loss: Optional[float],
     ) -> TrainingCheckpointMetadata:
-        checkpoint_path = os.path.join(self.config.checkpoint_dir, f"dqn_episode_{episode}.weights.h5")
+        checkpoint_path = os.path.join(
+            self.config.checkpoint_dir, f"dqn_episode_{episode}.weights.h5"
+        )
         self.model.save_model(checkpoint_path)
 
         metadata = TrainingCheckpointMetadata(

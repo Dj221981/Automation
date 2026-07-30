@@ -92,7 +92,9 @@ def test_train_step_returns_finite_loss_and_updates_metric():
 
 def test_train_step_validation_failures():
     model = AgentLearningModel(state_size=4, action_size=3)
-    states, actions, rewards, next_states, dones = _valid_batch(state_size=4, batch_size=8, action_size=3)
+    states, actions, rewards, next_states, dones = _valid_batch(
+        state_size=4, batch_size=8, action_size=3
+    )
 
     with pytest.raises(ValueError):
         model.train_step(states.reshape(4, 2, 4), actions, rewards, next_states, dones)
