@@ -15,3 +15,5 @@ coverage.xml
 htmlcov
 *.log
 .env
+logs/
+checkpoints/

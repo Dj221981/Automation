@@ -169,7 +169,9 @@ class DQNTrainingService:
         mean_reward: float,
         latest_loss: Optional[float],
     ) -> TrainingCheckpointMetadata:
-        checkpoint_path = os.path.join(self.config.checkpoint_dir, f"dqn_episode_{episode}.weights.h5")
+        checkpoint_path = os.path.join(
+            self.config.checkpoint_dir, f"dqn_episode_{episode}.weights.h5"
+        )
         self.model.save_model(checkpoint_path)
 
         metadata = TrainingCheckpointMetadata(

@@ -1,9 +1,15 @@
+node_modules/
+dist/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
 .venv/
 venv/
 .env
 .coverage
 coverage.xml
 htmlcov/
+coverage/
+logs/
+checkpoints/

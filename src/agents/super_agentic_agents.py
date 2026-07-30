@@ -126,7 +126,12 @@ class AgentCapability:
     version: str = "1.0.0"
     safe_mode_only: bool = True
     allowed_roles: Set[AgentRole] = field(
-        default_factory=lambda: {AgentRole.EXECUTOR, AgentRole.ANALYZER, AgentRole.LEARNER, AgentRole.ORCHESTRATOR}
+        default_factory=lambda: {
+            AgentRole.EXECUTOR,
+            AgentRole.ANALYZER,
+            AgentRole.LEARNER,
+            AgentRole.ORCHESTRATOR,
+        }
     )
     max_calls_per_minute: int = 60
     timeout_seconds: float = DEFAULT_CAPABILITY_TIMEOUT_SECONDS
@@ -408,7 +413,9 @@ class BaseAgent(ABC):
     def register_capability(self, capability: AgentCapability) -> bool:
         with self._lock:
             if capability.name in self.capabilities:
-                logger.warning("Capability '%s' already registered for %s", capability.name, self.name)
+                logger.warning(
+                    "Capability '%s' already registered for %s", capability.name, self.name
+                )
                 return False
             if len(self.capabilities) >= self.max_capabilities:
                 logger.warning("Agent %s has reached max capabilities limit", self.name)
@@ -428,7 +435,11 @@ class BaseAgent(ABC):
     def assign_task(self, task: Task) -> bool:
         with self._lock:
             if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
-                logger.warning("Task %s is not assignable because it is in status %s", task.id, task.status.value)
+                logger.warning(
+                    "Task %s is not assignable because it is in status %s",
+                    task.id,
+                    task.status.value,
+                )
                 return False
             if task.id in self.active_tasks:
                 logger.warning("Task %s is already active on agent %s", task.id, self.name)
@@ -499,9 +510,13 @@ class BaseAgent(ABC):
         self.performance_metrics[key] += 1
         self.performance_metrics["tasks_total"] += 1
         total = self.performance_metrics["tasks_total"]
-        self.performance_metrics["success_rate"] = self.performance_metrics["tasks_completed"] / total if total else 0
+        self.performance_metrics["success_rate"] = (
+            self.performance_metrics["tasks_completed"] / total if total else 0
+        )
         overall_prev = self.performance_metrics["avg_task_time_overall"]
-        self.performance_metrics["avg_task_time_overall"] = overall_prev + ((elapsed - overall_prev) / total)
+        self.performance_metrics["avg_task_time_overall"] = overall_prev + (
+            (elapsed - overall_prev) / total
+        )
         if success:
             n = self.performance_metrics["tasks_completed"]
             prev = self.performance_metrics["avg_task_time_success"]
@@ -538,15 +553,23 @@ class OrchestratorAgent(BaseAgent):
         self.task_queue: List[Task] = []
 
     def think(self, input_data: Any) -> Dict[str, Any]:
-        return {"analysis": "Task requires orchestration", "priority": "high", "execution_strategy": "parallel"}
+        return {
+            "analysis": "Task requires orchestration",
+            "priority": "high",
+            "execution_strategy": "parallel",
+        }
 
     def act(self, decision: Dict[str, Any]) -> Any:
-        logger.info("Orchestrator %s executing strategy: %s", self.name, decision.get("execution_strategy"))
+        logger.info(
+            "Orchestrator %s executing strategy: %s", self.name, decision.get("execution_strategy")
+        )
         return {"status": "orchestration_complete"}
 
     def register_agent(self, agent: BaseAgent) -> bool:
         if agent.id in self.managed_agents:
-            logger.warning("Agent %s is already registered under orchestrator %s", agent.name, self.name)
+            logger.warning(
+                "Agent %s is already registered under orchestrator %s", agent.name, self.name
+            )
             return False
         self.managed_agents[agent.id] = agent
         agent.parent_agent = self.id
@@ -567,7 +590,11 @@ class OrchestratorAgent(BaseAgent):
         return False
 
     def _select_best_agent(self, task: Task) -> Optional[BaseAgent]:
-        available_agents = [a for a in self.managed_agents.values() if a.status not in {AgentStatus.SUSPENDED, AgentStatus.BUSY}]
+        available_agents = [
+            a
+            for a in self.managed_agents.values()
+            if a.status not in {AgentStatus.SUSPENDED, AgentStatus.BUSY}
+        ]
         if not available_agents:
             return None
 
@@ -580,9 +607,15 @@ class OrchestratorAgent(BaseAgent):
                 capability_description = capability.description.lower()
                 if capability_name in task_description or task_description in capability_name:
                     capability_match += 3
-                elif any(token and token in task_description for token in capability_description.split()):
+                elif any(
+                    token and token in task_description for token in capability_description.split()
+                ):
                     capability_match += 1
-            return (capability_match, -len(agent.active_tasks), int(agent.performance_metrics["success_rate"] * 100))
+            return (
+                capability_match,
+                -len(agent.active_tasks),
+                int(agent.performance_metrics["success_rate"] * 100),
+            )
 
         return max(available_agents, key=score)
 
@@ -621,10 +654,18 @@ class AnalyzerAgent(BaseAgent):
         self.analysis_cache: Dict[str, Dict[str, Any]] = {}
 
     def think(self, input_data: Any) -> Dict[str, Any]:
-        return {"data_received": bool(input_data), "analysis_type": "comprehensive", "insights_generated": True}
+        return {
+            "data_received": bool(input_data),
+            "analysis_type": "comprehensive",
+            "insights_generated": True,
+        }
 
     def act(self, decision: Dict[str, Any]) -> Any:
-        return {"analysis_complete": True, "insights": _make_json_safe(decision), "timestamp": datetime.now().isoformat()}
+        return {
+            "analysis_complete": True,
+            "insights": _make_json_safe(decision),
+            "timestamp": datetime.now().isoformat(),
+        }
 
 
 class LearnerAgent(BaseAgent):
@@ -744,7 +785,9 @@ class AgentSystem:
         self.health_checker.register("queue", lambda: queue_health_check(self))
         logger.info("Initialized Agent System: %s", self.name)
 
-    def _emit_event(self, event_type: str, task: Optional[Task] = None, extra: Optional[Dict[str, Any]] = None) -> None:
+    def _emit_event(
+        self, event_type: str, task: Optional[Task] = None, extra: Optional[Dict[str, Any]] = None
+    ) -> None:
         payload: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "event_type": event_type,
@@ -757,8 +800,14 @@ class AgentSystem:
                     "task_id": task.id,
                     "task_status": task.status.value,
                     "assigned_to": task.assigned_to,
-                    "claimed_by": task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None,
-                    "correlation_id": task.metadata.get("correlation_id") if isinstance(task.metadata, dict) else None,
+                    "claimed_by": (
+                        task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None
+                    ),
+                    "correlation_id": (
+                        task.metadata.get("correlation_id")
+                        if isinstance(task.metadata, dict)
+                        else None
+                    ),
                 }
             )
         if extra:
@@ -815,7 +864,12 @@ class AgentSystem:
     def get_agent(self, agent_id: str) -> Optional[BaseAgent]:
         return self.agents.get(agent_id)
 
-    def create_task(self, description: str, parameters: Dict[str, Any], priority: TaskPriority = TaskPriority.NORMAL) -> Task:
+    def create_task(
+        self,
+        description: str,
+        parameters: Dict[str, Any],
+        priority: TaskPriority = TaskPriority.NORMAL,
+    ) -> Task:
         with self._lock:
             task = Task(description=description, parameters=parameters, priority=priority)
             task.metadata.setdefault("correlation_id", str(uuid.uuid4()))
@@ -836,7 +890,11 @@ class AgentSystem:
                 task = persisted
 
             if task.status != TaskStatus.PENDING:
-                logger.warning("Failed to submit task %s because it is in status %s", task.id, task.status.value)
+                logger.warning(
+                    "Failed to submit task %s because it is in status %s",
+                    task.id,
+                    task.status.value,
+                )
                 return False
 
             assigned = False
@@ -871,7 +929,9 @@ class AgentSystem:
                 raise KeyError(f"Task {task_id} is not assigned to agent {agent_id}")
 
             self._ensure_claimed_by(task, agent_id)
-            self._set_task_status(task, TaskStatus.RUNNING, assigned_to=agent_id, claimed_by=agent_id)
+            self._set_task_status(
+                task, TaskStatus.RUNNING, assigned_to=agent_id, claimed_by=agent_id
+            )
             self._emit_event("task_running", task)
 
         start_time = datetime.now()
@@ -954,7 +1014,9 @@ class AgentSystem:
             if task is None:
                 raise KeyError(f"Task not found: {task_id}")
             if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
-                raise ValueError(f"Task {task_id} in status {task.status.value} cannot be cancelled")
+                raise ValueError(
+                    f"Task {task_id} in status {task.status.value} cannot be cancelled"
+                )
 
             original_assigned_to = task.assigned_to
             self._release_task_from_agent(task.id, original_assigned_to)
@@ -999,7 +1061,9 @@ class AgentSystem:
                     working_task.result = None
                     working_task.error = None
                     working_task.completed_at = None
-                    self._set_task_status(working_task, TaskStatus.PENDING, assigned_to=None, claimed_by=None)
+                    self._set_task_status(
+                        working_task, TaskStatus.PENDING, assigned_to=None, claimed_by=None
+                    )
                     self._enqueue_if_missing(working_task)
                     self._emit_event("task_recovered", working_task)
                     recovered += 1
@@ -1141,11 +1205,15 @@ class AgentSystem:
             task.metadata["claimed_by"] = claimed_by
             task.metadata["claim_token"] = str(uuid.uuid4())
             task.metadata["claim_heartbeat_at"] = now.isoformat()
-            task.metadata["claim_expires_at"] = datetime.fromtimestamp(now.timestamp() + self.claim_ttl_seconds).isoformat()
+            task.metadata["claim_expires_at"] = datetime.fromtimestamp(
+                now.timestamp() + self.claim_ttl_seconds
+            ).isoformat()
 
     def _ensure_claimed_by(self, task: Task, agent_id: str) -> None:
         claimed_by = task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None
-        expires_raw = task.metadata.get("claim_expires_at") if isinstance(task.metadata, dict) else None
+        expires_raw = (
+            task.metadata.get("claim_expires_at") if isinstance(task.metadata, dict) else None
+        )
         expires_at: Optional[datetime] = None
         if isinstance(expires_raw, str):
             try:
@@ -1179,7 +1247,10 @@ class AgentSystem:
             return
         if len(self._task_index) >= self.max_queue_size:
             raise OverflowError(f"Task queue full ({self.max_queue_size})")
-        heapq.heappush(self.global_task_queue, (-int(task.priority.value), task.created_at.timestamp(), task.id))
+        heapq.heappush(
+            self.global_task_queue,
+            (-int(task.priority.value), task.created_at.timestamp(), task.id),
+        )
         self._task_index.add(task.id)
 
     def _dequeue_task(self, task_id: str) -> None:
@@ -1197,7 +1268,9 @@ class AgentSystem:
         self.system_metrics["completed_tasks_total"] += 1
         total = self.system_metrics["completed_tasks_total"]
         overall_prev = self.system_metrics["avg_task_duration_overall"]
-        self.system_metrics["avg_task_duration_overall"] = overall_prev + ((elapsed - overall_prev) / total)
+        self.system_metrics["avg_task_duration_overall"] = overall_prev + (
+            (elapsed - overall_prev) / total
+        )
         if success:
             n = self.system_metrics["successful_tasks"]
             prev = self.system_metrics["avg_task_duration_success"]
@@ -1271,7 +1344,9 @@ class AgentFactory:
         return None
 
     @classmethod
-    def create_team(cls, team_config: Dict[str, int], task_store: Optional[TaskStore] = None) -> AgentSystem:
+    def create_team(
+        cls, team_config: Dict[str, int], task_store: Optional[TaskStore] = None
+    ) -> AgentSystem:
         system = AgentSystem("Ai-morphasis-Team", task_store=task_store)
         for agent_type, count in team_config.items():
             if count < 0:
@@ -1341,5 +1416,7 @@ def example_usage() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
     example_usage()
