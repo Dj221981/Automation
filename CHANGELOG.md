@@ -1,5 +1,6 @@
 # Changelog
 
+<<<<<<< HEAD
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -16,3 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Expanded `requirements.txt` with runtime, quality, testing, and security dependencies.
 - Replaced root `README.md` with production-focused setup, configuration, and operations guidance.
+=======
+## Unreleased
+- Added observability modules for tracing, structured logging, and Prometheus metrics.
+- Added monitoring modules for health checks, thresholds, exporter, dashboards, and performance tracking.
+- Added resilience modules for circuit breakers, retries, and bulkhead isolation.
+- Added observability configuration and baseline documentation set.
+>>>>>>> origin/main

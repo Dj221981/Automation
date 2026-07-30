@@ -309,7 +309,39 @@ class TestAgentLearningModel(unittest.TestCase):
         )
 
         model.decay_epsilon()
+        self.assertEqual(model.epsilon, 0.019)
+        for _ in range(100):
+            model.decay_epsilon()
         self.assertEqual(model.epsilon, 0.01)
+
+    def test_training_loop_with_replay_integration(self):
+        """Test integrated replay sampling and multi-step training loop."""
+        model = AgentLearningModel(
+            state_size=self.state_size,
+            action_size=self.action_size,
+            target_update_interval=2,
+            seed=42
+        )
+        replay = ExperienceReplay(state_size=self.state_size, max_size=256, seed=42)
+
+        for _ in range(64):
+            state = np.random.randn(self.state_size).astype(np.float32)
+            next_state = np.random.randn(self.state_size).astype(np.float32)
+            action = model.select_action(state, training=True)
+            reward = float(np.random.randn())
+            done = bool(np.random.rand() > 0.8)
+            replay.add(state, action, reward, next_state, done)
+
+        losses = []
+        for _ in range(4):
+            batch = replay.sample(16)
+            loss = model.train_step(*batch)
+            model.decay_epsilon()
+            losses.append(loss)
+
+        self.assertEqual(model.train_steps, 4)
+        self.assertTrue(all(np.isfinite(loss) and loss >= 0 for loss in losses))
+        self.assertGreaterEqual(model.epsilon, model.epsilon_min)
 
     def test_get_config(self):
         """Test model configuration retrieval."""

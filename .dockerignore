@@ -1,4 +1,5 @@
 .git
+<<<<<<< HEAD
 node_modules
 dist
 __pycache__
@@ -10,3 +11,21 @@ checkpoints/
 tests/
 *.md
 .github/
+=======
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.venv
+venv
+node_modules
+dist
+build
+coverage.xml
+htmlcov
+*.log
+.env
+>>>>>>> origin/main
