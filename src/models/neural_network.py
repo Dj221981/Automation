@@ -36,7 +36,12 @@ from tensorflow.keras import Model, layers
 from tensorflow.keras.losses import Huber
 from tensorflow.keras.optimizers import Adam
 
+from src.observability.metrics import get_metrics_registry
+from src.observability.tracing import get_tracing_manager
+
 logger = logging.getLogger(__name__)
+_TRACING = get_tracing_manager()
+_METRICS = get_metrics_registry()
 
 _MAX_ARRAY_BYTES = 1 << 30
 _LARGE_ALLOCATION_BYTES = 64 << 20
@@ -767,21 +772,28 @@ class AgentLearningModel:
         dones: np.ndarray,
     ) -> float:
         """Perform one validated DQN training step on a batch of experiences."""
-        with self._operation_guard("train_step") as correlation_id:
-            with self._lock:
-                if self.training_paused:
-                    _structured_log(logging.INFO, "train_step_skipped_paused", correlation_id=correlation_id)
-                    return float(self.loss_ema or self.last_loss or 0.0)
-                self._assert_circuit_closed()
-                snapshot = self._snapshot_runtime_state()
-            try:
-                validated = self._validate_training_batch(states, actions, rewards, next_states, dones)
-                return self._train_step_with_recovery(*validated, correlation_id=correlation_id, snapshot=snapshot)
-            except Exception as error:
+        with _TRACING.start_span(
+            "dqn.train_step",
+            attributes={
+                "dqn.state_size": int(self.state_size),
+                "dqn.action_size": int(self.action_size),
+            },
+        ):
+            with self._operation_guard("train_step") as correlation_id:
                 with self._lock:
-                    self._restore_runtime_state(snapshot)
-                self._record_failure(error, correlation_id, "train_step")
-                raise
+                    if self.training_paused:
+                        _structured_log(logging.INFO, "train_step_skipped_paused", correlation_id=correlation_id)
+                        return float(self.loss_ema or self.last_loss or 0.0)
+                    self._assert_circuit_closed()
+                    snapshot = self._snapshot_runtime_state()
+                try:
+                    validated = self._validate_training_batch(states, actions, rewards, next_states, dones)
+                    return self._train_step_with_recovery(*validated, correlation_id=correlation_id, snapshot=snapshot)
+                except Exception as error:
+                    with self._lock:
+                        self._restore_runtime_state(snapshot)
+                    self._record_failure(error, correlation_id, "train_step")
+                    raise
 
     def _train_step_with_recovery(
         self,
@@ -910,6 +922,7 @@ class AgentLearningModel:
             gradient_max=gradient_max,
             duration_ms=duration_ms,
         )
+        _METRICS.record_training_step(loss=loss_value, epsilon=float(self.epsilon), learning_rate=self.learning_rate)
         return loss_value
 
     def update_target_network(self) -> None:

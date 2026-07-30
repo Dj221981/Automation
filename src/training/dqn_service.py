@@ -12,9 +12,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from src.monitoring.performance_tracker import PerformanceTracker
+from src.observability.tracing import get_tracing_manager
 from src.models.neural_network import AgentLearningModel, ExperienceReplay
 
 logger = logging.getLogger(__name__)
+_TRACING = get_tracing_manager()
 
 
 @dataclass
@@ -99,6 +102,7 @@ class DQNTrainingService:
             seed=config.seed,
         )
         self.training_steps = 0
+        self.performance_tracker = PerformanceTracker()
         self.training_history: Dict[str, List[float]] = {
             "step": [],
             "loss": [],
@@ -136,20 +140,25 @@ class DQNTrainingService:
             )
             return None
 
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.config.batch_size)
-        loss = self.model.train_step(states, actions, rewards, next_states, dones)
-        self.training_steps += 1
-        self.model.decay_epsilon()
+        with _TRACING.start_span(
+            "dqn.training_service.batch",
+            attributes={"replay_size": len(self.replay_buffer), "batch_size": self.config.batch_size},
+        ):
+            with self.performance_tracker.track("dqn_training_batch"):
+                states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.config.batch_size)
+                loss = self.model.train_step(states, actions, rewards, next_states, dones)
+                self.training_steps += 1
+                self.model.decay_epsilon()
 
-        if self.training_steps % self.config.target_update_interval == 0:
-            self.model.update_target_network()
+                if self.training_steps % self.config.target_update_interval == 0:
+                    self.model.update_target_network()
 
-        self.training_history["step"].append(self.training_steps)
-        self.training_history["loss"].append(float(loss))
-        self.training_history["epsilon"].append(float(self.model.epsilon))
-        self.training_history["replay_buffer_size"].append(float(len(self.replay_buffer)))
+                self.training_history["step"].append(self.training_steps)
+                self.training_history["loss"].append(float(loss))
+                self.training_history["epsilon"].append(float(self.model.epsilon))
+                self.training_history["replay_buffer_size"].append(float(len(self.replay_buffer)))
 
-        return float(loss)
+                return float(loss)
 
     def select_action(self, state: np.ndarray, training: bool = True) -> int:
         return self.model.select_action(state, training=training)
@@ -197,4 +206,6 @@ class DQNTrainingService:
             "epsilon": self.model.epsilon,
             "replay_buffer_size": len(self.replay_buffer),
             "latest_loss": latest_loss,
+            "performance": self.performance_tracker.snapshot(),
+            "resources": self.performance_tracker.resource_snapshot(),
         }
