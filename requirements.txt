@@ -8,3 +8,4 @@ opentelemetry-exporter-jaeger-thrift>=1.21.0,<2.0.0
 opentelemetry-exporter-zipkin-json>=1.21.0,<2.0.0
 python-json-logger>=2.0.7,<4.0.0
 psutil>=5.9.0,<7.0.0
+pytest>=8.0.0,<9.0.0

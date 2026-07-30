@@ -226,3 +226,93 @@ def test_experience_replay_sample_shapes_and_errors():
     assert rewards2.shape[0] == 5
     assert next_states2.shape[0] == 5
     assert dones2.shape[0] == 5
+
+
+def test_model_preset_and_config_immutability():
+    model = AgentLearningModel.create_with_preset(
+        "conservative",
+        state_size=4,
+        action_size=2,
+    )
+
+    assert model.learning_rate == pytest.approx(0.0005)
+    assert model.epsilon_decay == pytest.approx(0.997)
+
+    with pytest.raises(AttributeError):
+        model.state_size = 8
+
+
+def test_train_step_clips_rewards_and_updates_snapshot():
+    model = AgentLearningModel(state_size=4, action_size=3, seed=11)
+    batch = _valid_batch(state_size=4, batch_size=8, action_size=3)
+    states, actions, rewards, next_states, dones = batch
+    rewards[:] = 500.0
+
+    loss = model.train_step(states, actions, rewards, next_states, dones)
+    snapshot = model.get_state_snapshot()
+
+    assert np.isfinite(loss)
+    assert snapshot["reward_statistics"]["max"] == pytest.approx(1.0)
+    assert snapshot["reward_statistics"]["min"] == pytest.approx(1.0)
+    assert snapshot["metrics"]["last_memory_bytes"] > 0
+
+
+def test_pause_and_resume_training():
+    model = AgentLearningModel(state_size=4, action_size=3, seed=12)
+    batch = _valid_batch(state_size=4, batch_size=8, action_size=3)
+
+    model.pause_training()
+    paused_loss = model.train_step(*batch)
+    assert paused_loss == pytest.approx(0.0)
+    assert model.train_steps == 0
+
+    model.resume_training()
+    resumed_loss = model.train_step(*batch)
+    assert np.isfinite(resumed_loss)
+    assert model.train_steps == 1
+
+
+def test_save_and_load_hardening_checks(tmp_path):
+    model = AgentLearningModel(state_size=4, action_size=3, seed=13)
+    path = tmp_path / "secure.weights.h5"
+    model.save_model(str(path))
+    assert (tmp_path / "secure.weights.h5.sha256").exists()
+
+    with pytest.raises(ValueError):
+        model.save_model("../escape.weights.h5")
+
+    path.write_bytes(path.read_bytes() + b"tamper")
+    other = AgentLearningModel(state_size=4, action_size=3, seed=14)
+    with pytest.raises(ValueError):
+        other.load_model(str(path))
+
+
+def test_load_model_recovers_from_corrupt_metadata(tmp_path):
+    model = AgentLearningModel(state_size=4, action_size=3, seed=15)
+    path = tmp_path / "recover.weights.h5"
+    batch = _valid_batch(state_size=4, batch_size=8, action_size=3)
+    model.train_step(*batch)
+    model.save_model(str(path))
+
+    meta_path = tmp_path / "recover.weights.h5.meta.npz"
+    meta_path.write_text("not-an-npz", encoding="utf-8")
+
+    other = AgentLearningModel(state_size=4, action_size=3, seed=16)
+    other.load_model(str(path))
+    assert other.train_steps == 0
+
+
+def test_experience_replay_memory_hardening_and_snapshot():
+    with pytest.raises(ValueError):
+        ExperienceReplay(state_size=10_000, max_size=20_000)
+
+    replay = ExperienceReplay(state_size=4, max_size=4, seed=17)
+    state = np.ones(4, dtype=np.float32)
+    replay.add(state, 1, 100.0, state, False)
+
+    snapshot = replay.snapshot()
+    assert snapshot["size"] == 1
+    assert snapshot["memory_bytes"] > 0
+
+    _, _, rewards, _, _ = replay.sample(1)
+    assert rewards[0] == pytest.approx(1.0)
