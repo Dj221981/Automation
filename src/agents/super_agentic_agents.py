@@ -34,9 +34,26 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
+from src.monitoring.health_checks import (
+    HealthChecker,
+    agent_health_check,
+    database_health_check,
+    queue_health_check,
+    redis_health_check,
+)
+from src.monitoring.performance_tracker import PerformanceTracker
+from src.monitoring.thresholds import ThresholdMonitor
+from src.observability.metrics import get_metrics_registry
+from src.observability.structured_logging import get_logger
+from src.observability.tracing import get_tracing_manager
+from src.resilience.bulkheads import TaskQueueLimiter
+from src.resilience.circuit_breaker import CircuitBreaker
+
 from .task_store import InMemoryTaskStore, StoredTask, TaskStore
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+_TRACING = get_tracing_manager()
+_METRICS = get_metrics_registry()
 
 DEFAULT_CAPABILITY_TIMEOUT_SECONDS = 30.0
 MIN_CAPABILITY_TIMEOUT_SECONDS = 0.01
@@ -327,58 +344,62 @@ class BaseAgent(ABC):
             self._validate_capability_use(capability)
             self._audit("capability_execute_start", {"capability": capability_name, "kwargs_keys": list(kwargs.keys())})
         last_error: Optional[BaseException] = None
-        for attempt in range(1, capability.retry_attempts + 1):
-            start = datetime.now()
-            with self._lock:
-                self._audit(
-                    "capability_execute_attempt",
-                    {
-                        "capability": capability_name,
-                        "attempt": attempt,
-                        "max_attempts": capability.retry_attempts,
-                    },
-                )
-            try:
-                result = self._run_capability_with_timeout(capability, kwargs)
-                elapsed = (datetime.now() - start).total_seconds()
+        with _TRACING.start_span(
+            "agent.capability.execute",
+            attributes={"agent.id": self.id, "agent.role": self.role.value, "capability.name": capability_name},
+        ):
+            for attempt in range(1, capability.retry_attempts + 1):
+                start = datetime.now()
                 with self._lock:
                     self._audit(
-                        "capability_execute_success",
+                        "capability_execute_attempt",
                         {
                             "capability": capability_name,
                             "attempt": attempt,
-                            "elapsed_s": elapsed,
+                            "max_attempts": capability.retry_attempts,
                         },
                     )
-                return result
-            except Exception as exc:
-                last_error = exc
-                retryable = self._is_retryable_exception(capability, exc)
-                final_attempt = attempt >= capability.retry_attempts
-                with self._lock:
-                    if isinstance(exc, TimeoutError):
-                        self.performance_metrics["capability_timeouts"] += 1
-                    self.performance_metrics["capability_failures"] += 1
-                    self._audit(
-                        "capability_execute_error",
-                        {
-                            "capability": capability_name,
-                            "attempt": attempt,
-                            "retryable": retryable,
-                            "final_attempt": final_attempt,
-                            "error_type": exc.__class__.__name__,
-                            "error": str(exc),
-                        },
-                    )
-                if final_attempt or not retryable:
-                    raise
-                sleep_for = capability.retry_backoff_seconds * attempt
-                if capability.retry_jitter_seconds:
-                    sleep_for += random.uniform(0.0, capability.retry_jitter_seconds)
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
-                with self._lock:
-                    self.performance_metrics["capability_retries"] += 1
+                try:
+                    result = self._run_capability_with_timeout(capability, kwargs)
+                    elapsed = (datetime.now() - start).total_seconds()
+                    with self._lock:
+                        self._audit(
+                            "capability_execute_success",
+                            {
+                                "capability": capability_name,
+                                "attempt": attempt,
+                                "elapsed_s": elapsed,
+                            },
+                        )
+                    return result
+                except Exception as exc:
+                    last_error = exc
+                    retryable = self._is_retryable_exception(capability, exc)
+                    final_attempt = attempt >= capability.retry_attempts
+                    with self._lock:
+                        if isinstance(exc, TimeoutError):
+                            self.performance_metrics["capability_timeouts"] += 1
+                        self.performance_metrics["capability_failures"] += 1
+                        self._audit(
+                            "capability_execute_error",
+                            {
+                                "capability": capability_name,
+                                "attempt": attempt,
+                                "retryable": retryable,
+                                "final_attempt": final_attempt,
+                                "error_type": exc.__class__.__name__,
+                                "error": str(exc),
+                            },
+                        )
+                    if final_attempt or not retryable:
+                        raise
+                    sleep_for = capability.retry_backoff_seconds * attempt
+                    if capability.retry_jitter_seconds:
+                        sleep_for += random.uniform(0.0, capability.retry_jitter_seconds)
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    with self._lock:
+                        self.performance_metrics["capability_retries"] += 1
 
         if last_error is not None:
             raise last_error
@@ -690,6 +711,11 @@ class AgentSystem:
         self._inflight_execution_keys: Set[str] = set()
         self.dead_letter_queue: deque[Dict[str, Any]] = deque(maxlen=2000)
         self.max_retries_per_task = 3
+        self._queue_limiter = TaskQueueLimiter(max_tasks_per_agent=200)
+        self._task_execution_breaker = CircuitBreaker("agent_task_execution")
+        self.performance_tracker = PerformanceTracker()
+        self.threshold_monitor = ThresholdMonitor()
+        self.health_checker = HealthChecker()
         self.completed_tasks: List[Task] = []
         self.failed_tasks: List[Task] = []
         self.event_log: List[Dict[str, Any]] = []
@@ -712,6 +738,10 @@ class AgentSystem:
             "persistence_retries": 0,
             "idempotent_hits": 0,
         }
+        self.health_checker.register("agent_health", lambda: agent_health_check(self))
+        self.health_checker.register("database", lambda: database_health_check(self.task_store))
+        self.health_checker.register("redis", lambda: redis_health_check(None))
+        self.health_checker.register("queue", lambda: queue_health_check(self))
         logger.info("Initialized Agent System: %s", self.name)
 
     def _emit_event(self, event_type: str, task: Optional[Task] = None, extra: Optional[Dict[str, Any]] = None) -> None:
@@ -818,6 +848,9 @@ class AgentSystem:
                 assigned = self.orchestrator.distribute_task(task)
 
             if assigned:
+                if task.assigned_to and not self._queue_limiter.try_acquire(task.assigned_to):
+                    logger.warning("Agent %s queue limit reached; task %s rejected", task.assigned_to, task.id)
+                    return False
                 self._set_task_status(task, TaskStatus.ASSIGNED, assigned_to=task.assigned_to, claimed_by=task.assigned_to)
                 self._dequeue_task(task.id)
                 self._emit_event("task_assigned", task)
@@ -828,6 +861,7 @@ class AgentSystem:
             return False
 
     def execute_task(self, task_id: str, agent_id: str) -> Any:
+        limited_agent_id = agent_id
         with self._lock:
             agent = self.get_agent(agent_id)
             if not agent:
@@ -842,7 +876,12 @@ class AgentSystem:
 
         start_time = datetime.now()
         try:
-            result = agent.run_task(task)
+            with _TRACING.start_span(
+                "agent.task.execute",
+                attributes={"agent.id": agent_id, "task.id": task.id, "task.description": task.description},
+            ):
+                with self.performance_tracker.track("agent_task_execution"):
+                    result = self._task_execution_breaker.call(agent.run_task, task)
             with self._lock:
                 self._set_task_status(
                     task,
@@ -855,6 +894,8 @@ class AgentSystem:
                 )
                 self._append_unique_task(self.completed_tasks, task)
                 self._update_system_metrics(success=True, start_time=start_time)
+                elapsed = (datetime.now() - start_time).total_seconds()
+                _METRICS.record_agent_task(success=True, duration_seconds=elapsed)
                 self._emit_event("task_completed", task)
             return result
         except Exception as exc:
@@ -870,6 +911,8 @@ class AgentSystem:
                 )
                 self._append_unique_task(self.failed_tasks, task)
                 self._update_system_metrics(success=False, start_time=start_time)
+                elapsed = (datetime.now() - start_time).total_seconds()
+                _METRICS.record_agent_task(success=False, duration_seconds=elapsed)
                 attempts = int(task.metadata.get("attempts", 0)) + 1 if isinstance(task.metadata, dict) else 1
                 if isinstance(task.metadata, dict):
                     task.metadata["attempts"] = attempts
@@ -902,6 +945,8 @@ class AgentSystem:
                     self._emit_event("task_requeued", task, {"attempts": attempts})
                 self._emit_event("task_failed", task, {"error": str(exc)})
             raise
+        finally:
+            self._queue_limiter.release(limited_agent_id)
 
     def cancel_task(self, task_id: str, reason: Optional[str] = None) -> Task:
         with self._lock:
@@ -1177,11 +1222,29 @@ class AgentSystem:
             }
 
     def get_observability_snapshot(self) -> Dict[str, Any]:
+        perf_snapshot = self.performance_tracker.snapshot()
+        resource_snapshot = self.performance_tracker.resource_snapshot()
+        _METRICS.record_task_system(
+            queue_depth=len(self._task_index),
+            processing_time=float(self.system_metrics.get("avg_task_duration_overall", 0.0)),
+            throughput=float(self.system_metrics.get("completed_tasks_total", 0.0)),
+        )
+        _METRICS.record_resources(
+            memory_usage=resource_snapshot.get("memory_rss_bytes", 0.0),
+            cpu_usage=resource_snapshot.get("cpu_percent", 0.0),
+            model_size=0.0,
+        )
+        metric_snapshot = _METRICS.snapshot()
         return {
             "metrics": _make_json_safe(self.system_metrics),
+            "prometheus_metrics": metric_snapshot,
             "recent_events": self.event_log[-200:],
             "queue_depth": len(self._task_index),
             "dead_letter_depth": len(self.dead_letter_queue),
+            "health": self.health_checker.run(),
+            "performance": perf_snapshot,
+            "resource_usage": resource_snapshot,
+            "alerts": self.threshold_monitor.evaluate(metrics=metric_snapshot),
         }
 
     def to_json(self) -> str:

@@ -28,8 +28,13 @@ from tensorflow.keras import Model, layers
 from tensorflow.keras.losses import Huber
 from tensorflow.keras.optimizers import Adam
 
+from src.observability.metrics import get_metrics_registry
+from src.observability.tracing import get_tracing_manager
+
 # Configure logging
 logger = logging.getLogger(__name__)
+_TRACING = get_tracing_manager()
+_METRICS = get_metrics_registry()
 
 
 class DQNNetwork(Model):
@@ -338,47 +343,56 @@ class AgentLearningModel:
         states, actions, rewards, next_states, dones = self._validate_training_batch(
             states, actions, rewards, next_states, dones
         )
+        with _TRACING.start_span(
+            "dqn.train_step",
+            attributes={
+                "dqn.batch_size": int(states.shape[0]),
+                "dqn.state_size": int(self.state_size),
+                "dqn.action_size": int(self.action_size),
+            },
+        ):
+            with tf.device(self.device_name):
+                states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
+                actions_tensor = tf.convert_to_tensor(actions, dtype=tf.int32)
+                rewards_tensor = tf.convert_to_tensor(rewards, dtype=tf.float32)
+                next_states_tensor = tf.convert_to_tensor(next_states, dtype=tf.float32)
+                dones_tensor = tf.convert_to_tensor(dones, dtype=tf.float32)
 
-        with tf.device(self.device_name):
-            states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
-            actions_tensor = tf.convert_to_tensor(actions, dtype=tf.int32)
-            rewards_tensor = tf.convert_to_tensor(rewards, dtype=tf.float32)
-            next_states_tensor = tf.convert_to_tensor(next_states, dtype=tf.float32)
-            dones_tensor = tf.convert_to_tensor(dones, dtype=tf.float32)
+                with tf.GradientTape() as tape:
+                    q_values = self.network(states_tensor, training=True)
+                    batch_indices = tf.range(tf.shape(q_values)[0], dtype=tf.int32)
+                    action_indices = tf.stack([batch_indices, actions_tensor], axis=1)
+                    current_q = tf.gather_nd(q_values, action_indices)
 
-            with tf.GradientTape() as tape:
-                q_values = self.network(states_tensor, training=True)
-                batch_indices = tf.range(tf.shape(q_values)[0], dtype=tf.int32)
-                action_indices = tf.stack([batch_indices, actions_tensor], axis=1)
-                current_q = tf.gather_nd(q_values, action_indices)
+                    next_q_values = self.target_network(next_states_tensor, training=False)
+                    max_next_q = tf.reduce_max(next_q_values, axis=1)
+                    target_q = rewards_tensor + self.gamma * max_next_q * (1.0 - dones_tensor)
+                    target_q = tf.stop_gradient(target_q)
 
-                next_q_values = self.target_network(next_states_tensor, training=False)
-                max_next_q = tf.reduce_max(next_q_values, axis=1)
-                target_q = rewards_tensor + self.gamma * max_next_q * (1.0 - dones_tensor)
-                target_q = tf.stop_gradient(target_q)
+                    loss = self.loss_fn(target_q, current_q)
 
-                loss = self.loss_fn(target_q, current_q)
+                if not tf.math.is_finite(loss):
+                    raise ValueError("training produced a non-finite loss value")
 
-            if not tf.math.is_finite(loss):
-                raise ValueError("training produced a non-finite loss value")
+                gradients = tape.gradient(loss, self.network.trainable_weights)
+                gradients_and_weights = [
+                    (gradient, weight)
+                    for gradient, weight in zip(gradients, self.network.trainable_weights)
+                    if gradient is not None
+                ]
+                if not gradients_and_weights:
+                    raise RuntimeError("no gradients were produced during the training step")
 
-            gradients = tape.gradient(loss, self.network.trainable_weights)
-            gradients_and_weights = [
-                (gradient, weight)
-                for gradient, weight in zip(gradients, self.network.trainable_weights)
-                if gradient is not None
-            ]
-            if not gradients_and_weights:
-                raise RuntimeError("no gradients were produced during the training step")
+                self.optimizer.apply_gradients(gradients_and_weights)
+                self.train_loss.update_state(loss)
 
-            self.optimizer.apply_gradients(gradients_and_weights)
-            self.train_loss.update_state(loss)
+                self.train_steps += 1
+                if self.train_steps % self.target_update_interval == 0:
+                    self.update_target_network()
 
-            self.train_steps += 1
-            if self.train_steps % self.target_update_interval == 0:
-                self.update_target_network()
-
-            return float(loss.numpy())
+                loss_value = float(loss.numpy())
+                _METRICS.record_training_step(loss=loss_value, epsilon=float(self.epsilon), learning_rate=self.learning_rate)
+                return loss_value
 
     def update_target_network(self) -> None:
         """Synchronize target network weights from the online network."""
