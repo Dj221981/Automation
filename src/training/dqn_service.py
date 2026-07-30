@@ -140,14 +140,6 @@ class DQNTrainingService:
             )
             return None
 
-<<<<<<< HEAD
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(
-            self.config.batch_size
-        )
-        loss = self.model.train_step(states, actions, rewards, next_states, dones)
-        self.training_steps += 1
-        self.model.decay_epsilon()
-=======
         with _TRACING.start_span(
             "dqn.training_service.batch",
             attributes={"replay_size": len(self.replay_buffer), "batch_size": self.config.batch_size},
@@ -157,7 +149,6 @@ class DQNTrainingService:
                 loss = self.model.train_step(states, actions, rewards, next_states, dones)
                 self.training_steps += 1
                 self.model.decay_epsilon()
->>>>>>> origin/main
 
                 if self.training_steps % self.config.target_update_interval == 0:
                     self.model.update_target_network()

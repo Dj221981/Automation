@@ -1,21 +1,15 @@
-<<<<<<< HEAD
 node_modules/
 dist/
 __pycache__/
-.pytest_cache/
-*.pyc
-coverage/
-.env
-logs/
-checkpoints/
-=======
-__pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
 .venv/
 venv/
 .env
 .coverage
 coverage.xml
 htmlcov/
->>>>>>> origin/main
+coverage/
+logs/
+checkpoints/

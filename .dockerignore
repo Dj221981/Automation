@@ -1,17 +1,4 @@
 .git
-<<<<<<< HEAD
-node_modules
-dist
-__pycache__
-*.pyc
-*.pyo
-.env
-logs/
-checkpoints/
-tests/
-*.md
-.github/
-=======
 .github
 __pycache__
 *.pyc
@@ -28,4 +15,5 @@ coverage.xml
 htmlcov
 *.log
 .env
->>>>>>> origin/main
+logs/
+checkpoints/

@@ -347,30 +347,6 @@ class BaseAgent(ABC):
             if capability.func is None:
                 raise ValueError(f"Capability {capability_name} has no bound function")
             self._validate_capability_use(capability)
-<<<<<<< HEAD
-            self._audit(
-                "capability_execute_start",
-                {"capability": capability_name, "kwargs_keys": list(kwargs.keys())},
-            )
-        start = datetime.now()
-        try:
-            result = capability.func(**kwargs)
-            elapsed = (datetime.now() - start).total_seconds()
-            if elapsed > capability.timeout_seconds:
-                raise TimeoutError(f"Capability {capability_name} exceeded timeout: {elapsed:.3f}s")
-            with self._lock:
-                self._audit(
-                    "capability_execute_success",
-                    {"capability": capability_name, "elapsed_s": elapsed},
-                )
-            return result
-        except Exception as exc:
-            with self._lock:
-                self._audit(
-                    "capability_execute_error", {"capability": capability_name, "error": str(exc)}
-                )
-            raise
-=======
             self._audit("capability_execute_start", {"capability": capability_name, "kwargs_keys": list(kwargs.keys())})
         last_error: Optional[BaseException] = None
         with _TRACING.start_span(
@@ -433,7 +409,6 @@ class BaseAgent(ABC):
         if last_error is not None:
             raise last_error
         raise RuntimeError(f"Capability execution failed: {capability_name}")
->>>>>>> origin/main
 
     def register_capability(self, capability: AgentCapability) -> bool:
         with self._lock:
@@ -931,19 +906,10 @@ class AgentSystem:
                 assigned = self.orchestrator.distribute_task(task)
 
             if assigned:
-<<<<<<< HEAD
-                self._set_task_status(
-                    task,
-                    TaskStatus.ASSIGNED,
-                    assigned_to=task.assigned_to,
-                    claimed_by=task.assigned_to,
-                )
-=======
                 if task.assigned_to and not self._queue_limiter.try_acquire(task.assigned_to):
                     logger.warning("Agent %s queue limit reached; task %s rejected", task.assigned_to, task.id)
                     return False
                 self._set_task_status(task, TaskStatus.ASSIGNED, assigned_to=task.assigned_to, claimed_by=task.assigned_to)
->>>>>>> origin/main
                 self._dequeue_task(task.id)
                 self._emit_event("task_assigned", task)
                 logger.info("Task %s submitted successfully", task.id)
@@ -1005,17 +971,9 @@ class AgentSystem:
                 )
                 self._append_unique_task(self.failed_tasks, task)
                 self._update_system_metrics(success=False, start_time=start_time)
-<<<<<<< HEAD
-                attempts = (
-                    int(task.metadata.get("attempts", 0)) + 1
-                    if isinstance(task.metadata, dict)
-                    else 1
-                )
-=======
                 elapsed = (datetime.now() - start_time).total_seconds()
                 _METRICS.record_agent_task(success=False, duration_seconds=elapsed)
                 attempts = int(task.metadata.get("attempts", 0)) + 1 if isinstance(task.metadata, dict) else 1
->>>>>>> origin/main
                 if isinstance(task.metadata, dict):
                     task.metadata["attempts"] = attempts
                 max_attempts = (
