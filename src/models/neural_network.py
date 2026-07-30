@@ -934,10 +934,7 @@ class AgentLearningModel:
         """Decay epsilon while respecting the configured minimum value."""
         with self._lock:
             decayed_epsilon = self.epsilon * self.epsilon_decay
-            if self.epsilon <= self.epsilon_min * 2:
-                self.epsilon = self.epsilon_min
-            else:
-                self.epsilon = max(self.epsilon_min, decayed_epsilon)
+            self.epsilon = max(self.epsilon_min, decayed_epsilon)
 
     def get_model_summary(self) -> str:
         """Return the model summary as a string."""
