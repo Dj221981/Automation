@@ -1,30 +1,30 @@
 ---
 name: Bug report
-about: Report a reproducible problem
+about: Create a report to help us improve
+title: "[Bug] "
 labels: bug
+assignees: ""
 ---
 
-## Summary
+## Description
+Provide a clear and concise description of the bug.
 
-Provide a concise description of the bug.
+## Steps to Reproduce
+1. Go to '...'
+2. Run '...'
+3. Observe error
 
-## Steps to reproduce
+## Expected Behavior
+Describe what you expected to happen.
 
-1.
-2.
-3.
-
-## Expected behavior
-
-Describe what should happen.
-
-## Actual behavior
-
-Describe what currently happens.
+## Actual Behavior
+Describe what actually happened.
 
 ## Environment
-
 - OS:
 - Python version:
-- Node version:
-- Additional context:
+- Node.js version:
+- Commit/branch:
+
+## Additional Context
+Add any other context, logs, or screenshots about the problem here.

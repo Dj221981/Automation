@@ -19,3 +19,4 @@
 - [ ] Tests pass
 - [ ] Linting/format checks pass
 - [ ] Documentation updated (if needed)
+- [ ] No secrets were introduced
