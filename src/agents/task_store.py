@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from threading import RLock
 from typing import Any, Dict, List, Optional
-
 
 ALLOWED_TASK_STATUSES = {
     "PENDING",
@@ -99,7 +99,11 @@ class InMemoryTaskStore(TaskStore):
             values = [_validated_copy(task) for task in self._tasks.values()]
             if normalized_status is None:
                 return sorted(values, key=lambda t: t.created_at, reverse=True)
-            return sorted([t for t in values if t.status == normalized_status], key=lambda t: t.created_at, reverse=True)
+            return sorted(
+                [t for t in values if t.status == normalized_status],
+                key=lambda t: t.created_at,
+                reverse=True,
+            )
 
 
 class RedisTaskStore(TaskStore):
@@ -120,7 +124,9 @@ class RedisTaskStore(TaskStore):
         try:
             import redis  # type: ignore
         except ImportError as exc:
-            raise ImportError("redis package is required for RedisTaskStore. Install `redis>=5`.") from exc
+            raise ImportError(
+                "redis package is required for RedisTaskStore. Install `redis>=5`."
+            ) from exc
 
         self._redis = redis.Redis.from_url(redis_url, decode_responses=True)
         self._prefix = key_prefix
@@ -139,7 +145,9 @@ class RedisTaskStore(TaskStore):
         safe_task = _validated_copy(task)
         payload = asdict(safe_task)
         payload["created_at"] = safe_task.created_at.isoformat()
-        payload["completed_at"] = safe_task.completed_at.isoformat() if safe_task.completed_at else ""
+        payload["completed_at"] = (
+            safe_task.completed_at.isoformat() if safe_task.completed_at else ""
+        )
         payload["parameters"] = json.dumps(safe_task.parameters)
         payload["dependencies"] = json.dumps(safe_task.dependencies)
         payload["metadata"] = json.dumps(safe_task.metadata)
@@ -157,7 +165,9 @@ class RedisTaskStore(TaskStore):
             assigned_to=data.get("assigned_to") or None,
             status=data.get("status", "PENDING"),
             created_at=datetime.fromisoformat(data["created_at"]),
-            completed_at=datetime.fromisoformat(data["completed_at"]) if data.get("completed_at") else None,
+            completed_at=(
+                datetime.fromisoformat(data["completed_at"]) if data.get("completed_at") else None
+            ),
             result=json.loads(data.get("result", "null")),
             error=data.get("error") or None,
             parameters=json.loads(data.get("parameters", "{}")),
@@ -245,6 +255,42 @@ class RedisTaskStore(TaskStore):
 
         tasks.sort(key=lambda t: t.created_at, reverse=True)
         return tasks
+
+
+def create_task_store(backend: Optional[str] = None, **kwargs: Any) -> TaskStore:
+    """
+    Create a task store from explicit backend name or environment settings.
+
+    Supported backends:
+      - inmemory (default)
+      - redis
+      - postgres
+    """
+    resolved_backend = (backend or os.getenv("TASK_STORE_BACKEND", "inmemory")).strip().lower()
+
+    if resolved_backend == "inmemory":
+        return InMemoryTaskStore()
+
+    if resolved_backend == "redis":
+        redis_url = kwargs.get("redis_url") or os.getenv("TASK_STORE_REDIS_URL")
+        if not redis_url:
+            raise ValueError("TASK_STORE_REDIS_URL is required for redis task store backend")
+        key_prefix = kwargs.get("key_prefix", os.getenv("TASK_STORE_KEY_PREFIX", "agent"))
+        return RedisTaskStore(redis_url=redis_url, key_prefix=key_prefix)
+
+    if resolved_backend == "postgres":
+        postgres_dsn = kwargs.get("postgres_dsn") or os.getenv("TASK_STORE_POSTGRES_DSN")
+        if not postgres_dsn:
+            raise ValueError("TASK_STORE_POSTGRES_DSN is required for postgres task store backend")
+        table_name = kwargs.get("table_name", os.getenv("TASK_STORE_POSTGRES_TABLE", "tasks"))
+        from src.persistence.postgres_task_store import PostgresTaskStore
+
+        return PostgresTaskStore(dsn=postgres_dsn, table_name=table_name)
+
+    raise ValueError(
+        f"Unsupported task store backend '{resolved_backend}'. "
+        "Supported values: inmemory, redis, postgres"
+    )
 
 
 def normalize_task_status(status: str) -> str:

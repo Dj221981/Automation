@@ -52,7 +52,7 @@ class ConfigManager:
             raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 self.config = json.load(f)
             logger.info(f"Configuration loaded from {config_path}")
         except json.JSONDecodeError as e:
@@ -68,12 +68,12 @@ class ConfigManager:
         for key, value in os.environ.items():
             if key.startswith(self.env_prefix):
                 # Parse environment variable name
-                parts = key[len(self.env_prefix):].lower().split('_')
+                parts = key[len(self.env_prefix) :].lower().split("_")
                 if len(parts) < 2:
                     continue
 
                 section = parts[0]
-                config_key = '_'.join(parts[1:])
+                config_key = "_".join(parts[1:])
 
                 if section not in self.config:
                     logger.warning(f"Section {section} not in configuration")
@@ -99,14 +99,14 @@ class ConfigManager:
             Converted value (int, float, bool, or str)
         """
         # Try boolean
-        if value.lower() in ('true', 'yes', '1'):
+        if value.lower() in ("true", "yes", "1"):
             return True
-        if value.lower() in ('false', 'no', '0'):
+        if value.lower() in ("false", "no", "0"):
             return False
 
         # Try integer
         try:
-            if '.' not in value:
+            if "." not in value:
                 return int(value)
         except ValueError:
             pass
@@ -166,9 +166,7 @@ class ConfigManager:
 
             for field in fields:
                 if field not in self.config[section]:
-                    raise ValueError(
-                        f"Required field missing: {section}.{field}"
-                    )
+                    raise ValueError(f"Required field missing: {section}.{field}")
 
     def to_dict(self) -> Dict[str, Any]:
         """Get configuration as dictionary."""
@@ -188,7 +186,7 @@ class ConfigManager:
             output_path = str(output_path)
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-            with open(output_path, 'w') as f:
+            with open(output_path, "w") as f:
                 json.dump(self.config, f, indent=2)
 
             logger.info(f"Configuration saved to {output_path}")
@@ -214,7 +212,7 @@ def get_config_manager(config_path: Optional[str] = None) -> ConfigManager:
     global _config_manager
 
     if _config_manager is None:
-        default_path = config_path or os.environ.get('AUTOMATION_CONFIG', 'config/production.json')
+        default_path = config_path or os.environ.get("AUTOMATION_CONFIG", "config/production.json")
         _config_manager = ConfigManager(default_path if os.path.exists(default_path) else None)
         _config_manager.apply_env_overrides()
 
