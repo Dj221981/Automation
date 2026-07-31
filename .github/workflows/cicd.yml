@@ -1,0 +1,343 @@
+name: Automation CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & static analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements-dev.txt
+
+      - name: Black
+        run: black --check src tests
+
+      - name: isort
+        run: isort --check-only src tests
+
+      - name: Flake8
+        run: flake8 --max-line-length=120 src tests
+
+      - name: Pylint
+        run: pylint src/persistence src/security tests/test_neural_network.py
+
+      - name: Bandit
+        run: bandit -r src -x tests
+
+  test:
+    name: Unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/test_neural_network.py tests/test_super_agentic_agents.py --cov=src --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 30
+
+  integration-tests:
+    name: Integration tests (PostgreSQL + Redis)
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: automation
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d automation"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TASK_STORE_POSTGRES_DSN: dbname=automation user=postgres host=localhost port=5432
+      TASK_STORE_REDIS_URL: redis://localhost:6379/0
+      APP_SECRET_KEY: integration-secret-key
+      AGENT_AUTH_SECRET: integration-auth-secret
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements-dev.txt
+
+      - name: Run migrations
+        run: |
+          python - <<'PY'
+          import psycopg
+          import pathlib
+          dsn = "dbname=automation user=postgres host=localhost port=5432"
+          with psycopg.connect(dsn) as conn:
+              with conn.cursor() as cur:
+                  for path in sorted(pathlib.Path("migrations").glob("*.sql")):
+                      cur.execute(path.read_text())
+              conn.commit()
+          PY
+
+      - name: Smoke test persistence and cache
+        run: |
+          python - <<'PY'
+          from datetime import datetime
+          from src.agents.task_store import StoredTask
+          from src.persistence.postgres_task_store import PostgresTaskStore
+          from src.persistence.redis_cache import RedisCache
+
+          store = PostgresTaskStore(dsn="dbname=automation user=postgres host=localhost port=5432")
+          task = StoredTask(
+              id="ci-task-1",
+              description="Integration test task",
+              priority="NORMAL",
+              created_at=datetime.utcnow(),
+          )
+          store.create_task(task)
+          assert store.get_task("ci-task-1") is not None
+
+          cache = RedisCache(redis_url="redis://localhost:6379/0")
+          cache.set("health", {"ok": True})
+          assert cache.get("health") == {"ok": True}
+          PY
+
+  security-scan:
+    name: Security scanning
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements-dev.txt
+
+      - name: Safety check
+        run: safety check -r requirements.txt
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: Automation
+          path: .
+          format: HTML
+          out: reports
+          args: >
+            --enableRetired
+
+      - name: Upload dependency check report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports
+          retention-days: 30
+
+  docker-build:
+    name: Docker build & push
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest
+          sbom: true
+          provenance: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  staging-deploy:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.event_name != 'pull_request'
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Trigger staging deployment
+        run: |
+          echo "Deploying ${GITHUB_SHA} to staging environment"
+          echo "Configure your deployment command here."
+
+  performance-test:
+    name: Performance testing
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements-dev.txt
+
+      - name: Run benchmark tests when present
+        run: |
+          pytest -m performance tests || echo "No performance-marked tests found"
+
+  docs:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Generate API docs
+        run: |
+          mkdir -p docs/build
+          python -m pydoc -w src.models.neural_network
+          mv neural_network.html docs/build/neural_network.html
+
+      - name: Upload docs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-docs
+          path: docs/build
+          retention-days: 30

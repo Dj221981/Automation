@@ -8,32 +8,131 @@ and orchestrating intelligent agentic agents with evolved capabilities.
 
 Features:
     - Hierarchical agent architecture
-    - Agent memory and state management
+    - Agent memory and state management (with optional Redis persistence)
     - Inter-agent communication
-    - Distributed task execution
+    - Distributed async task execution with concurrency control
     - Dynamic capability evolution
-    - Agent reasoning and decision-making
+    - Agent reasoning and decision-making (with optional LLM integration)
+    - Retry & exponential backoff error recovery
+    - Structured JSON logging & observability
+    - Pydantic v2 input validation
+    - Thread-safe synchronous execution with monitoring
+    - Task persistence (in-memory, Redis, Postgres)
+    - Health checks & performance tracking
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import hashlib
 import heapq
 import json
 import logging
+import random
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type
+
+from src.monitoring.health_checks import (
+    HealthChecker,
+    agent_health_check,
+    database_health_check,
+    queue_health_check,
+    redis_health_check,
+)
+from src.monitoring.performance_tracker import PerformanceTracker
+from src.monitoring.thresholds import ThresholdMonitor
+from src.observability.metrics import get_metrics_registry
+from src.observability.structured_logging import get_logger
+from src.observability.tracing import get_tracing_manager
+from src.resilience.bulkheads import TaskQueueLimiter
+from src.resilience.circuit_breaker import CircuitBreaker
 
 from .task_store import InMemoryTaskStore, StoredTask, TaskStore
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Optional dependency imports (graceful degradation)
+# ---------------------------------------------------------------------------
+try:
+    import openai  # noqa: F401 - used via type hints only at runtime
+    _HAS_OPENAI = True
+except ImportError:
+    _HAS_OPENAI = False
+
+try:
+    import redis.asyncio as aioredis
+    _HAS_REDIS = True
+except ImportError:
+    _HAS_REDIS = False
+
+try:
+    from pydantic import BaseModel, Field, field_validator
+    import pydantic
+    _HAS_PYDANTIC = True
+except ImportError:
+    _HAS_PYDANTIC = False
+
+
+# ---------------------------------------------------------------------------
+# Structured Logger
+# ---------------------------------------------------------------------------
+
+class StructuredLogger:
+    """Wraps :class:`logging.Logger` and auto-injects structured fields as JSON extras."""
+
+    def __init__(self, name: str, agent_id: str = "", agent_name: str = "") -> None:
+        self._logger = logging.getLogger(name)
+        self._base_extra: Dict[str, Any] = {
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+        }
+
+    def _extra(self, task_id: str = "", **kw: Any) -> Dict[str, Any]:
+        extra = dict(self._base_extra)
+        if task_id:
+            extra["task_id"] = task_id
+        extra.update(kw)
+        return {"structured": extra}
+
+    def info(self, msg: str, task_id: str = "", **kw: Any) -> None:
+        self._logger.info(msg, extra=self._extra(task_id, **kw))
+
+    def warning(self, msg: str, task_id: str = "", **kw: Any) -> None:
+        self._logger.warning(msg, extra=self._extra(task_id, **kw))
+
+    def error(self, msg: str, task_id: str = "", **kw: Any) -> None:
+        self._logger.error(msg, extra=self._extra(task_id, **kw))
+
+    def debug(self, msg: str, task_id: str = "", **kw: Any) -> None:
+        self._logger.debug(msg, extra=self._extra(task_id, **kw))
+
+
+logger = get_logger(__name__)
+_TRACING = get_tracing_manager()
+_METRICS = get_metrics_registry()
+
+DEFAULT_CAPABILITY_TIMEOUT_SECONDS = 30.0
+MIN_CAPABILITY_TIMEOUT_SECONDS = 0.01
+MAX_CAPABILITY_TIMEOUT_SECONDS = 300.0
+MIN_CAPABILITY_RATE_LIMIT = 1
+MAX_CAPABILITY_RATE_LIMIT = 10000
+DEFAULT_CAPABILITY_RETRY_ATTEMPTS = 1
+MAX_CAPABILITY_RETRY_ATTEMPTS = 5
+MAX_RETRY_BACKOFF_SECONDS = 5.0
+
+DEFAULT_CLAIM_TTL_SECONDS = 60
+DEFAULT_CLAIM_GRACE_SECONDS = 10
+DEFAULT_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 20
+DEFAULT_MAX_QUEUE_SIZE = 10000
+DEFAULT_MAX_PERSIST_RETRIES = 3
 MAX_RETRY_EXPONENT = 10
 
 
@@ -92,10 +191,19 @@ class AgentCapability:
     version: str = "1.0.0"
     safe_mode_only: bool = True
     allowed_roles: Set[AgentRole] = field(
-        default_factory=lambda: {AgentRole.EXECUTOR, AgentRole.ANALYZER, AgentRole.LEARNER, AgentRole.ORCHESTRATOR}
+        default_factory=lambda: {
+            AgentRole.EXECUTOR,
+            AgentRole.ANALYZER,
+            AgentRole.LEARNER,
+            AgentRole.ORCHESTRATOR,
+        }
     )
     max_calls_per_minute: int = 60
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = DEFAULT_CAPABILITY_TIMEOUT_SECONDS
+    retry_attempts: int = DEFAULT_CAPABILITY_RETRY_ATTEMPTS
+    retry_backoff_seconds: float = 0.0
+    retry_jitter_seconds: float = 0.0
+    non_retryable_exceptions: Tuple[Type[BaseException], ...] = (PermissionError,)
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -104,6 +212,22 @@ class AgentCapability:
             raise ValueError("Capability description cannot be empty")
         if not 0.0 <= self.confidence_score <= 1.0:
             raise ValueError("Capability confidence_score must be between 0.0 and 1.0")
+        if not MIN_CAPABILITY_RATE_LIMIT <= self.max_calls_per_minute <= MAX_CAPABILITY_RATE_LIMIT:
+            raise ValueError(
+                f"max_calls_per_minute must be between {MIN_CAPABILITY_RATE_LIMIT} and {MAX_CAPABILITY_RATE_LIMIT}"
+            )
+        if not MIN_CAPABILITY_TIMEOUT_SECONDS <= self.timeout_seconds <= MAX_CAPABILITY_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"timeout_seconds must be between {MIN_CAPABILITY_TIMEOUT_SECONDS} and {MAX_CAPABILITY_TIMEOUT_SECONDS}"
+            )
+        if not DEFAULT_CAPABILITY_RETRY_ATTEMPTS <= self.retry_attempts <= MAX_CAPABILITY_RETRY_ATTEMPTS:
+            raise ValueError(
+                f"retry_attempts must be between {DEFAULT_CAPABILITY_RETRY_ATTEMPTS} and {MAX_CAPABILITY_RETRY_ATTEMPTS}"
+            )
+        if self.retry_backoff_seconds < 0 or self.retry_backoff_seconds > MAX_RETRY_BACKOFF_SECONDS:
+            raise ValueError(f"retry_backoff_seconds must be between 0 and {MAX_RETRY_BACKOFF_SECONDS}")
+        if self.retry_jitter_seconds < 0 or self.retry_jitter_seconds > MAX_RETRY_BACKOFF_SECONDS:
+            raise ValueError(f"retry_jitter_seconds must be between 0 and {MAX_RETRY_BACKOFF_SECONDS}")
 
     def __repr__(self) -> str:
         return f"<Capability: {self.name} v{self.version} ({self.confidence_score:.2%})>"
@@ -111,7 +235,13 @@ class AgentCapability:
 
 @dataclass(slots=True)
 class AgentMemory:
-    """Represents agent memory with episodic and semantic storage."""
+    """Represents agent memory with episodic and semantic storage.
+
+    Supports an optional Redis backend for persistence.  When *redis_url* is
+    provided the class will attempt to create an async Redis connection on first
+    use; if Redis is unavailable it falls back transparently to in-process dicts
+    and logs a warning.
+    """
 
     agent_id: str
     episodic_memory: Dict[str, Any] = field(default_factory=dict)
@@ -120,8 +250,11 @@ class AgentMemory:
     created_at: datetime = field(default_factory=datetime.now)
     last_accessed: datetime = field(default_factory=datetime.now)
     max_episodes: int = 1000
+    redis_url: Optional[str] = field(default=None)
+    _redis: Any = field(default=None, init=False, repr=False, compare=False)
 
     def store_episode(self, key: str, value: Any) -> None:
+        """Store an episode in short-term memory (in-process)."""
         if len(self.episodic_memory) >= self.max_episodes:
             oldest_key = next(iter(self.episodic_memory))
             del self.episodic_memory[oldest_key]
@@ -129,6 +262,7 @@ class AgentMemory:
         self.last_accessed = datetime.now()
 
     def store_semantic(self, key: str, value: Any) -> None:
+        """Store knowledge in long-term memory (in-process)."""
         self.semantic_memory[key] = {
             "value": value,
             "timestamp": datetime.now(),
@@ -137,6 +271,7 @@ class AgentMemory:
         self.last_accessed = datetime.now()
 
     def retrieve(self, key: str, memory_type: str = "auto") -> Optional[Any]:
+        """Retrieve from memory (auto-selects best source, in-process only)."""
         if memory_type in ("auto", "episodic") and key in self.episodic_memory:
             self.last_accessed = datetime.now()
             return self.episodic_memory[key]["value"]
@@ -144,6 +279,80 @@ class AgentMemory:
             self.semantic_memory[key]["access_count"] += 1
             self.last_accessed = datetime.now()
             return self.semantic_memory[key]["value"]
+        return None
+
+    # ------------------------------------------------------------------
+    # Redis helpers (async, optional)
+    # ------------------------------------------------------------------
+
+    async def _get_redis(self) -> Optional[Any]:
+        """Return a connected Redis client, or None if unavailable."""
+        if not _HAS_REDIS or not self.redis_url:
+            return None
+        if self._redis is None:
+            try:
+                self._redis = aioredis.from_url(
+                    self.redis_url, decode_responses=True
+                )
+                await self._redis.ping()
+            except Exception as exc:
+                logger.warning("Redis unavailable (%s); using in-memory store.", exc)
+                self._redis = None
+        return self._redis
+
+    def _episodic_redis_key(self, key: str) -> str:
+        return f"agent:{self.agent_id}:episodic:{key}"
+
+    def _semantic_redis_key(self, key: str) -> str:
+        return f"agent:{self.agent_id}:semantic:{key}"
+
+    async def async_store_episode(self, key: str, value: Any) -> None:
+        """Store an episode in short-term memory (with optional Redis TTL=3600s)."""
+        self.store_episode(key, value)
+        redis = await self._get_redis()
+        if redis:
+            try:
+                payload = json.dumps({"value": value, "timestamp": datetime.now().isoformat()},
+                                     default=str)
+                await redis.set(self._episodic_redis_key(key), payload, ex=3600)
+            except Exception as exc:
+                logger.warning("Redis store_episode error: %s", exc)
+
+    async def async_store_semantic(self, key: str, value: Any) -> None:
+        """Store knowledge in long-term memory (with optional Redis, no expiry)."""
+        self.store_semantic(key, value)
+        redis = await self._get_redis()
+        if redis:
+            try:
+                payload = json.dumps(
+                    {"value": value, "timestamp": datetime.now().isoformat(), "access_count": 0},
+                    default=str,
+                )
+                await redis.set(self._semantic_redis_key(key), payload)
+            except Exception as exc:
+                logger.warning("Redis store_semantic error: %s", exc)
+
+    async def async_retrieve(self, key: str, memory_type: str = "auto") -> Optional[Any]:
+        """Retrieve from memory, checking Redis when available."""
+        local = self.retrieve(key, memory_type)
+        if local is not None:
+            return local
+        redis = await self._get_redis()
+        if redis:
+            memory_types = ["episodic", "semantic"] if memory_type == "auto" else [memory_type]
+            redis_key_fn = {
+                "episodic": self._episodic_redis_key,
+                "semantic": self._semantic_redis_key,
+            }
+            for kind in memory_types:
+                rkey = redis_key_fn[kind](key)
+                try:
+                    raw = await redis.get(rkey)
+                    if raw:
+                        data = json.loads(raw)
+                        return data.get("value")
+                except Exception as exc:
+                    logger.warning("Redis retrieve error: %s", exc)
         return None
 
 
@@ -192,11 +401,100 @@ class TaskQueueEntry:
     id: str = field(compare=False)
     generation: int = field(compare=False, default=0)
 
+# ============================================================================
+# Pydantic v2 Validation Models (graceful degradation if pydantic not installed)
+# ============================================================================
+
+if _HAS_PYDANTIC:
+    class AgentConfig(BaseModel):
+        """Validates inputs for creating an agent."""
+
+        name: str = Field(..., min_length=1, max_length=100)
+        role: AgentRole = AgentRole.EXECUTOR
+        max_capabilities: int = Field(default=50, ge=1, le=200)
+        max_retries: int = Field(default=3, ge=0, le=10)
+
+    class TaskConfig(BaseModel):
+        """Validates inputs for creating a task."""
+
+        description: str = Field(..., min_length=1)
+        priority: TaskPriority = TaskPriority.NORMAL
+        parameters: Dict[str, Any] = Field(default_factory=dict)
+        dependencies: List[str] = Field(default_factory=list)
+
+        @field_validator("dependencies")
+        @classmethod
+        def validate_uuids(cls, v: List[str]) -> List[str]:
+            import re
+            uuid_re = re.compile(
+                r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                re.IGNORECASE,
+            )
+            for item in v:
+                if not uuid_re.match(item):
+                    raise ValueError(f"Invalid UUID in dependencies: {item}")
+            return v
+
+else:
+    # Minimal fallback when pydantic is not available
+    class AgentConfig:  # type: ignore[no-redef]
+        """Fallback AgentConfig without Pydantic validation."""
+
+        def __init__(
+            self,
+            name: str,
+            role: AgentRole = AgentRole.EXECUTOR,
+            max_capabilities: int = 50,
+            max_retries: int = 3,
+        ) -> None:
+            if not name or len(name) > 100:
+                raise ValueError("Agent name must be 1-100 characters")
+            if not 1 <= max_capabilities <= 200:
+                raise ValueError("max_capabilities must be 1-200")
+            if not 0 <= max_retries <= 10:
+                raise ValueError("max_retries must be 0-10")
+            self.name = name
+            self.role = role
+            self.max_capabilities = max_capabilities
+            self.max_retries = max_retries
+
+    class TaskConfig:  # type: ignore[no-redef]
+        """Fallback TaskConfig without Pydantic validation."""
+
+        def __init__(
+            self,
+            description: str,
+            priority: TaskPriority = TaskPriority.NORMAL,
+            parameters: Optional[Dict[str, Any]] = None,
+            dependencies: Optional[List[str]] = None,
+        ) -> None:
+            import re
+            if not description:
+                raise ValueError("Task description cannot be empty")
+            uuid_re = re.compile(
+                r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                re.IGNORECASE,
+            )
+            for item in (dependencies or []):
+                if not uuid_re.match(item):
+                    raise ValueError(f"Invalid UUID in dependencies: {item}")
+            self.description = description
+            self.priority = priority
+            self.parameters = parameters or {}
+            self.dependencies = dependencies or []
 
 class BaseAgent(ABC):
     """Abstract base class for all agents."""
 
-    def __init__(self, name: str, role: AgentRole = AgentRole.EXECUTOR, max_capabilities: int = 50):
+    def __init__(
+        self,
+        name: str,
+        role: AgentRole = AgentRole.EXECUTOR,
+        max_capabilities: int = 50,
+        *,
+        redis_url: Optional[str] = None,
+        llm_client: Optional[Any] = None,
+    ):
         if not name.strip():
             raise ValueError("Agent name cannot be empty")
         if max_capabilities <= 0:
@@ -210,7 +508,9 @@ class BaseAgent(ABC):
         self.last_activity = datetime.now()
         self.capabilities: Dict[str, AgentCapability] = {}
         self.max_capabilities = max_capabilities
-        self.memory = AgentMemory(agent_id=self.id)
+        self.memory = AgentMemory(agent_id=self.id, redis_url=redis_url)
+        self.llm_client = llm_client
+        self._slog = StructuredLogger(__name__, agent_id=self.id, agent_name=name)
         self.active_tasks: Dict[str, Task] = {}
         self.completed_tasks: List[Task] = []
         self.failed_tasks: List[Task] = []
@@ -223,6 +523,7 @@ class BaseAgent(ABC):
         self._capability_call_log: Dict[str, List[datetime]] = {}
         self._audit_log: List[Dict[str, Any]] = []
         self.max_audit_entries = 5000
+        self._capability_executor = ThreadPoolExecutor(max_workers=max(4, max_capabilities), thread_name_prefix=f"cap-{self.name}")
         self.performance_metrics = {
             "tasks_completed": 0,
             "tasks_failed": 0,
@@ -231,6 +532,9 @@ class BaseAgent(ABC):
             "avg_task_time_failure": 0.0,
             "avg_task_time_overall": 0.0,
             "success_rate": 1.0,
+            "capability_timeouts": 0,
+            "capability_retries": 0,
+            "capability_failures": 0,
         }
         logger.info("Initialized %s agent: %s (ID: %s)", self.role.value, self.name, self.id)
 
@@ -270,6 +574,20 @@ class BaseAgent(ABC):
             raise RuntimeError(f"Rate limit exceeded for capability {capability.name}")
         calls.append(now)
 
+    def _run_capability_with_timeout(self, capability: AgentCapability, kwargs: Dict[str, Any]) -> Any:
+        future: Future[Any] = self._capability_executor.submit(capability.func, **kwargs)  # type: ignore[misc]
+        try:
+            return future.result(timeout=capability.timeout_seconds)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError(
+                f"Capability {capability.name} timed out after {capability.timeout_seconds:.3f}s"
+            ) from exc
+
+    @staticmethod
+    def _is_retryable_exception(capability: AgentCapability, exc: BaseException) -> bool:
+        return not isinstance(exc, capability.non_retryable_exceptions)
+
     def execute_capability(self, capability_name: str, **kwargs: Any) -> Any:
         with self._lock:
             capability = self.capabilities.get(capability_name)
@@ -279,24 +597,74 @@ class BaseAgent(ABC):
                 raise ValueError(f"Capability {capability_name} has no bound function")
             self._validate_capability_use(capability)
             self._audit("capability_execute_start", {"capability": capability_name, "kwargs_keys": list(kwargs.keys())})
-        start = datetime.now()
-        try:
-            result = capability.func(**kwargs)
-            elapsed = (datetime.now() - start).total_seconds()
-            if elapsed > capability.timeout_seconds:
-                raise TimeoutError(f"Capability {capability_name} exceeded timeout: {elapsed:.3f}s")
-            with self._lock:
-                self._audit("capability_execute_success", {"capability": capability_name, "elapsed_s": elapsed})
-            return result
-        except Exception as exc:
-            with self._lock:
-                self._audit("capability_execute_error", {"capability": capability_name, "error": str(exc)})
-            raise
+        last_error: Optional[BaseException] = None
+        with _TRACING.start_span(
+            "agent.capability.execute",
+            attributes={"agent.id": self.id, "agent.role": self.role.value, "capability.name": capability_name},
+        ):
+            for attempt in range(1, capability.retry_attempts + 1):
+                start = datetime.now()
+                with self._lock:
+                    self._audit(
+                        "capability_execute_attempt",
+                        {
+                            "capability": capability_name,
+                            "attempt": attempt,
+                            "max_attempts": capability.retry_attempts,
+                        },
+                    )
+                try:
+                    result = self._run_capability_with_timeout(capability, kwargs)
+                    elapsed = (datetime.now() - start).total_seconds()
+                    with self._lock:
+                        self._audit(
+                            "capability_execute_success",
+                            {
+                                "capability": capability_name,
+                                "attempt": attempt,
+                                "elapsed_s": elapsed,
+                            },
+                        )
+                    return result
+                except Exception as exc:
+                    last_error = exc
+                    retryable = self._is_retryable_exception(capability, exc)
+                    final_attempt = attempt >= capability.retry_attempts
+                    with self._lock:
+                        if isinstance(exc, TimeoutError):
+                            self.performance_metrics["capability_timeouts"] += 1
+                        self.performance_metrics["capability_failures"] += 1
+                        self._audit(
+                            "capability_execute_error",
+                            {
+                                "capability": capability_name,
+                                "attempt": attempt,
+                                "retryable": retryable,
+                                "final_attempt": final_attempt,
+                                "error_type": exc.__class__.__name__,
+                                "error": str(exc),
+                            },
+                        )
+                    if final_attempt or not retryable:
+                        raise
+                    sleep_for = capability.retry_backoff_seconds * attempt
+                    if capability.retry_jitter_seconds:
+                        sleep_for += random.uniform(0.0, capability.retry_jitter_seconds)
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    with self._lock:
+                        self.performance_metrics["capability_retries"] += 1
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"Capability execution failed: {capability_name}")
 
     def register_capability(self, capability: AgentCapability) -> bool:
         with self._lock:
             if capability.name in self.capabilities:
-                logger.warning("Capability '%s' already registered for %s", capability.name, self.name)
+                logger.warning(
+                    "Capability '%s' already registered for %s", capability.name, self.name
+                )
                 return False
             if len(self.capabilities) >= self.max_capabilities:
                 logger.warning("Agent %s has reached max capabilities limit", self.name)
@@ -316,7 +684,11 @@ class BaseAgent(ABC):
     def assign_task(self, task: Task) -> bool:
         with self._lock:
             if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
-                logger.warning("Task %s is not assignable because it is in status %s", task.id, task.status.value)
+                logger.warning(
+                    "Task %s is not assignable because it is in status %s",
+                    task.id,
+                    task.status.value,
+                )
                 return False
             if task.id in self.active_tasks:
                 logger.warning("Task %s is already active on agent %s", task.id, self.name)
@@ -368,6 +740,27 @@ class BaseAgent(ABC):
             self.memory.store_episode(f"task:{task.id}", task)
             self._touch()
 
+    async def execute_task(self, task: "Task") -> Any:
+        """Async wrapper around run_task for callers using async/await.
+
+        Sets task.status to COMPLETED on success or FAILED on error, and
+        records ``duration_ms`` in task.metadata for observability.
+        """
+        if task.id not in self.active_tasks:
+            self.assign_task(task)
+        start = datetime.now()
+        try:
+            result = self.run_task(task)
+            task.status = TaskStatus.COMPLETED
+            elapsed_ms = (datetime.now() - start).total_seconds() * 1000
+            if isinstance(task.metadata, dict):
+                task.metadata["duration_ms"] = elapsed_ms
+            return result
+        except Exception as exc:
+            task.status = TaskStatus.FAILED
+            task.error = str(exc)
+            raise
+
     def release_task(self, task_id: str) -> None:
         with self._lock:
             self.active_tasks.pop(task_id, None)
@@ -387,9 +780,13 @@ class BaseAgent(ABC):
         self.performance_metrics[key] += 1
         self.performance_metrics["tasks_total"] += 1
         total = self.performance_metrics["tasks_total"]
-        self.performance_metrics["success_rate"] = self.performance_metrics["tasks_completed"] / total if total else 0
+        self.performance_metrics["success_rate"] = (
+            self.performance_metrics["tasks_completed"] / total if total else 0
+        )
         overall_prev = self.performance_metrics["avg_task_time_overall"]
-        self.performance_metrics["avg_task_time_overall"] = overall_prev + ((elapsed - overall_prev) / total)
+        self.performance_metrics["avg_task_time_overall"] = overall_prev + (
+            (elapsed - overall_prev) / total
+        )
         if success:
             n = self.performance_metrics["tasks_completed"]
             prev = self.performance_metrics["avg_task_time_success"]
@@ -420,21 +817,29 @@ class BaseAgent(ABC):
 
 
 class OrchestratorAgent(BaseAgent):
-    def __init__(self, name: str = "Orchestrator"):
-        super().__init__(name, role=AgentRole.ORCHESTRATOR)
+    def __init__(self, name: str = "Orchestrator", **kwargs: Any):
+        super().__init__(name, role=AgentRole.ORCHESTRATOR, **kwargs)
         self.managed_agents: Dict[str, BaseAgent] = {}
         self.task_queue: List[Task] = []
 
     def think(self, input_data: Any) -> Dict[str, Any]:
-        return {"analysis": "Task requires orchestration", "priority": "high", "execution_strategy": "parallel"}
+        return {
+            "analysis": "Task requires orchestration",
+            "priority": "high",
+            "execution_strategy": "parallel",
+        }
 
     def act(self, decision: Dict[str, Any]) -> Any:
-        logger.info("Orchestrator %s executing strategy: %s", self.name, decision.get("execution_strategy"))
+        logger.info(
+            "Orchestrator %s executing strategy: %s", self.name, decision.get("execution_strategy")
+        )
         return {"status": "orchestration_complete"}
 
     def register_agent(self, agent: BaseAgent) -> bool:
         if agent.id in self.managed_agents:
-            logger.warning("Agent %s is already registered under orchestrator %s", agent.name, self.name)
+            logger.warning(
+                "Agent %s is already registered under orchestrator %s", agent.name, self.name
+            )
             return False
         self.managed_agents[agent.id] = agent
         agent.parent_agent = self.id
@@ -455,7 +860,11 @@ class OrchestratorAgent(BaseAgent):
         return False
 
     def _select_best_agent(self, task: Task) -> Optional[BaseAgent]:
-        available_agents = [a for a in self.managed_agents.values() if a.status not in {AgentStatus.SUSPENDED, AgentStatus.BUSY}]
+        available_agents = [
+            a
+            for a in self.managed_agents.values()
+            if a.status not in {AgentStatus.SUSPENDED, AgentStatus.BUSY}
+        ]
         if not available_agents:
             return None
 
@@ -468,9 +877,15 @@ class OrchestratorAgent(BaseAgent):
                 capability_description = capability.description.lower()
                 if capability_name in task_description or task_description in capability_name:
                     capability_match += 3
-                elif any(token and token in task_description for token in capability_description.split()):
+                elif any(
+                    token and token in task_description for token in capability_description.split()
+                ):
                     capability_match += 1
-            return (capability_match, -len(agent.active_tasks), int(agent.performance_metrics["success_rate"] * 100))
+            return (
+                capability_match,
+                -len(agent.active_tasks),
+                int(agent.performance_metrics["success_rate"] * 100),
+            )
 
         return max(available_agents, key=score)
 
@@ -484,8 +899,8 @@ class OrchestratorAgent(BaseAgent):
 
 
 class ExecutorAgent(BaseAgent):
-    def __init__(self, name: str = "Executor"):
-        super().__init__(name, role=AgentRole.EXECUTOR)
+    def __init__(self, name: str = "Executor", **kwargs: Any):
+        super().__init__(name, role=AgentRole.EXECUTOR, **kwargs)
         self.execution_history: List[Dict[str, Any]] = []
 
     def think(self, input_data: Any) -> Dict[str, Any]:
@@ -504,20 +919,28 @@ class ExecutorAgent(BaseAgent):
 
 
 class AnalyzerAgent(BaseAgent):
-    def __init__(self, name: str = "Analyzer"):
-        super().__init__(name, role=AgentRole.ANALYZER)
+    def __init__(self, name: str = "Analyzer", **kwargs: Any):
+        super().__init__(name, role=AgentRole.ANALYZER, **kwargs)
         self.analysis_cache: Dict[str, Dict[str, Any]] = {}
 
     def think(self, input_data: Any) -> Dict[str, Any]:
-        return {"data_received": bool(input_data), "analysis_type": "comprehensive", "insights_generated": True}
+        return {
+            "data_received": bool(input_data),
+            "analysis_type": "comprehensive",
+            "insights_generated": True,
+        }
 
     def act(self, decision: Dict[str, Any]) -> Any:
-        return {"analysis_complete": True, "insights": _make_json_safe(decision), "timestamp": datetime.now().isoformat()}
+        return {
+            "analysis_complete": True,
+            "insights": _make_json_safe(decision),
+            "timestamp": datetime.now().isoformat(),
+        }
 
 
 class LearnerAgent(BaseAgent):
-    def __init__(self, name: str = "Learner"):
-        super().__init__(name, role=AgentRole.LEARNER)
+    def __init__(self, name: str = "Learner", **kwargs: Any):
+        super().__init__(name, role=AgentRole.LEARNER, **kwargs)
         self.learned_patterns: Dict[str, Any] = {}
         self.learning_history: List[Dict[str, Any]] = []
 
@@ -556,9 +979,29 @@ class AgentSystem:
         TaskStatus.CANCELLED: set(),
     }
 
-    def __init__(self, name: str = "Ai-morphasis", task_store: Optional[TaskStore] = None):
+    def __init__(
+        self,
+        name: str = "Ai-morphasis",
+        task_store: Optional[TaskStore] = None,
+        *,
+        claim_ttl_seconds: int = DEFAULT_CLAIM_TTL_SECONDS,
+        claim_grace_seconds: int = DEFAULT_CLAIM_GRACE_SECONDS,
+        claim_heartbeat_interval_seconds: int = DEFAULT_CLAIM_HEARTBEAT_INTERVAL_SECONDS,
+        max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
+        max_persist_retries: int = DEFAULT_MAX_PERSIST_RETRIES,
+    ):
         if not name.strip():
             raise ValueError("System name cannot be empty")
+        if claim_ttl_seconds <= 0:
+            raise ValueError("claim_ttl_seconds must be greater than 0")
+        if claim_grace_seconds < 0:
+            raise ValueError("claim_grace_seconds must be greater than or equal to 0")
+        if claim_heartbeat_interval_seconds <= 0:
+            raise ValueError("claim_heartbeat_interval_seconds must be greater than 0")
+        if max_queue_size <= 0:
+            raise ValueError("max_queue_size must be greater than 0")
+        if max_persist_retries <= 0:
+            raise ValueError("max_persist_retries must be greater than 0")
 
         self.name = name
         self.id = str(uuid.uuid4())
@@ -566,24 +1009,46 @@ class AgentSystem:
         self.task_store = task_store or InMemoryTaskStore()
         self._lock = threading.RLock()
         self._task_versions: Dict[str, int] = {}
-        self._max_persist_retries = 3
-        self.claim_ttl_seconds = 60
-        self.claim_grace_seconds = 10
+        self._max_persist_retries = max_persist_retries
+        self.persistence_backoff_min_seconds = 0.01
+        self.persistence_backoff_max_seconds = 0.25
+        self.persistence_backoff_max_exponent = 6
+        self.persistence_backoff_jitter_ratio = 0.1
+        self._retry_random = random.Random()
+        self.claim_ttl_seconds = claim_ttl_seconds
+        self.claim_grace_seconds = claim_grace_seconds
+        self.claim_heartbeat_interval_seconds = claim_heartbeat_interval_seconds
+        self.claim_sweep_interval_seconds = 1.0
+        self.worker_poll_interval_seconds = 0.05
         self.retry_backoff_base_seconds = 5
         self.retry_backoff_max_seconds = 300
         self.orchestrator = OrchestratorAgent(f"{name}-Orchestrator")
         self.agents: Dict[str, BaseAgent] = {self.orchestrator.id: self.orchestrator}
-        self.max_queue_size = 10000
+        self.max_queue_size = max_queue_size
         self._global_task_queue: List[TaskQueueEntry] = []
         self._queue_generations: Dict[str, int] = {}
         self._task_index: Set[str] = set()
+        self._queue_sequence = 0
+        self._execution_results: Dict[str, Dict[str, Any]] = {}
+        self._inflight_execution_keys: Set[str] = set()
         self.dead_letter_queue: deque[Dict[str, Any]] = deque(maxlen=2000)
         self._retry_backlog = 0
         self.max_retries_per_task = 3
+        self._queue_limiter = TaskQueueLimiter(max_tasks_per_agent=200)
+        self._task_execution_breaker = CircuitBreaker("agent_task_execution")
+        self.performance_tracker = PerformanceTracker()
+        self.threshold_monitor = ThresholdMonitor()
+        self.health_checker = HealthChecker()
         self.completed_tasks: List[Task] = []
         self.failed_tasks: List[Task] = []
         self.event_log: List[Dict[str, Any]] = []
         self.max_events = 10000
+        self._idempotency_index: Dict[str, str] = {}
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()
+        self._worker_threads: List[threading.Thread] = []
+        self._maintenance_thread: Optional[threading.Thread] = None
         self.system_metrics = {
             "total_agents": 1,
             "total_tasks": 0,
@@ -593,15 +1058,38 @@ class AgentSystem:
             "avg_task_duration_success": 0.0,
             "avg_task_duration_failure": 0.0,
             "avg_task_duration_overall": 0.0,
+            "queue_stale_pops": 0,
+            "dependency_blocked_tasks": 0,
+            "claim_reclaims": 0,
+            "persistence_retry_attempts": 0,
+            "persistence_failures": 0,
+            "queue_overflow_drops": 0,
+            "queue_stale_entries_pruned": 0,
+            "claim_renew_success": 0,
+            "claim_renew_failures": 0,
+            "claim_validation_failures": 0,
+            "persistence_conflicts": 0,
+            "persistence_retries": 0,
+            "idempotent_hits": 0,
         }
+        self.health_checker.register("agent_health", lambda: agent_health_check(self))
+        self.health_checker.register("database", lambda: database_health_check(self.task_store))
+        self.health_checker.register("redis", lambda: redis_health_check(None))
+        self.health_checker.register("queue", lambda: queue_health_check(self))
         logger.info("Initialized Agent System: %s", self.name)
 
     def _emit_event(self, event_type: str, task: Optional[Task] = None, extra: Optional[Dict[str, Any]] = None) -> None:
+        correlation_id = None
+        if task is not None and isinstance(task.metadata, dict):
+            correlation_id = task.metadata.get("correlation_id")
+        elif extra and isinstance(extra, dict):
+            correlation_id = extra.get("correlation_id")
         payload: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "event_type": event_type,
             "system_id": self.id,
             "system_name": self.name,
+            "correlation_id": correlation_id,
         }
         if task is not None:
             payload.update(
@@ -610,7 +1098,6 @@ class AgentSystem:
                     "task_status": task.status.value,
                     "assigned_to": task.assigned_to,
                     "claimed_by": task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None,
-                    "correlation_id": task.metadata.get("correlation_id") if isinstance(task.metadata, dict) else None,
                 }
             )
         if extra:
@@ -633,6 +1120,75 @@ class AgentSystem:
         if not isinstance(task.metadata, dict):
             task.metadata = {}
         task.metadata["_version"] = int(version)
+
+    def _ensure_task_metadata(self, task: Task) -> Dict[str, Any]:
+        if not isinstance(task.metadata, dict):
+            task.metadata = {}
+        return task.metadata
+
+    def _parse_datetime(self, raw: Any) -> Optional[datetime]:
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+
+    def _synchronize_task(self, target: Task, source: Task) -> Task:
+        target.description = source.description
+        target.priority = source.priority
+        target.assigned_to = source.assigned_to
+        target.status = source.status
+        target.created_at = source.created_at
+        target.completed_at = source.completed_at
+        target.result = copy.deepcopy(source.result)
+        target.error = source.error
+        target.parameters = copy.deepcopy(dict(source.parameters))
+        target.dependencies = copy.deepcopy(list(source.dependencies))
+        target.metadata = copy.deepcopy(dict(source.metadata))
+        return target
+
+    def _extract_idempotency_key(
+        self, parameters: Optional[Dict[str, Any]], metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        nested_metadata = parameters.get("metadata") if isinstance(parameters, dict) else None
+        candidates = [
+            metadata.get("idempotency_key") if isinstance(metadata, dict) else None,
+            parameters.get("idempotency_key") if isinstance(parameters, dict) else None,
+            nested_metadata.get("idempotency_key") if isinstance(nested_metadata, dict) else None,
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+
+    def _find_task_by_idempotency_key(self, idempotency_key: str) -> Optional[Task]:
+        task_id = self._idempotency_index.get(idempotency_key)
+        if task_id:
+            task = self.load_task(task_id)
+            if task is not None:
+                return task
+            self._idempotency_index.pop(idempotency_key, None)
+
+        for task in self.list_persisted_tasks():
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            if metadata.get("idempotency_key") == idempotency_key:
+                self._idempotency_index[idempotency_key] = task.id
+                return task
+        return None
+
+    def _get_unmet_dependencies(self, task: Task) -> List[str]:
+        unmet: List[str] = []
+        for dependency_id in list(task.dependencies):
+            if not isinstance(dependency_id, str) or not dependency_id.strip():
+                continue
+            dependency = self.load_task(dependency_id)
+            if dependency is None or dependency.status != TaskStatus.COMPLETED:
+                unmet.append(dependency_id)
+        return unmet
 
     def add_agent(self, agent: BaseAgent) -> bool:
         with self._lock:
@@ -667,12 +1223,46 @@ class AgentSystem:
     def get_agent(self, agent_id: str) -> Optional[BaseAgent]:
         return self.agents.get(agent_id)
 
-    def create_task(self, description: str, parameters: Dict[str, Any], priority: TaskPriority = TaskPriority.NORMAL) -> Task:
+    def create_task(
+        self,
+        description: str,
+        parameters: Dict[str, Any],
+        priority: TaskPriority = TaskPriority.NORMAL,
+        dependencies: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Task:
         with self._lock:
-            task = Task(description=description, parameters=parameters, priority=priority)
-            task.metadata.setdefault("correlation_id", str(uuid.uuid4()))
-            task.metadata.setdefault("attempts", 0)
-            task.metadata.setdefault("max_attempts", self.max_retries_per_task)
+            safe_parameters = copy.deepcopy(parameters) if isinstance(parameters, dict) else {}
+            safe_metadata = copy.deepcopy(metadata) if isinstance(metadata, dict) else {}
+            parameter_dependencies = safe_parameters.get("dependencies", [])
+            if dependencies is not None:
+                safe_dependencies = list(dependencies)
+            elif isinstance(parameter_dependencies, list):
+                safe_dependencies = list(parameter_dependencies)
+            else:
+                safe_dependencies = []
+            idempotency_key = self._extract_idempotency_key(safe_parameters, safe_metadata)
+            if idempotency_key:
+                existing = self._find_task_by_idempotency_key(idempotency_key)
+                if existing is not None:
+                    self.system_metrics["idempotent_hits"] += 1
+                    self._emit_event("task_create_deduplicated", existing, {"idempotency_key": idempotency_key})
+                    return existing
+
+            task = Task(
+                description=description,
+                parameters=safe_parameters,
+                priority=priority,
+                dependencies=safe_dependencies,
+                metadata=safe_metadata,
+            )
+            task_metadata = self._ensure_task_metadata(task)
+            task_metadata.setdefault("correlation_id", str(uuid.uuid4()))
+            task_metadata.setdefault("attempts", 0)
+            task_metadata.setdefault("max_attempts", self.max_retries_per_task)
+            if idempotency_key:
+                task_metadata["idempotency_key"] = idempotency_key
+                self._idempotency_index[idempotency_key] = task.id
             self._set_claim(task, None)
             self._enqueue_if_missing(task)
             self.system_metrics["total_tasks"] += 1
@@ -692,7 +1282,18 @@ class AgentSystem:
                     self._sync_task(task, self._from_stored_task(stored))
 
             if task.status != TaskStatus.PENDING:
-                logger.warning("Failed to submit task %s because it is in status %s", task.id, task.status.value)
+                logger.warning(
+                    "Failed to submit task %s because it is in status %s",
+                    task.id,
+                    task.status.value,
+                )
+                return False
+            unmet_dependencies = self._get_unmet_dependencies(task)
+            if unmet_dependencies:
+                self.system_metrics["dependency_blocked_tasks"] += 1
+                self._enqueue_if_missing(task)
+                self._emit_event("task_dependency_blocked", task, {"dependencies": unmet_dependencies})
+                logger.info("Task %s blocked by unmet dependencies: %s", task.id, unmet_dependencies)
                 return False
 
             assigned = False
@@ -704,6 +1305,9 @@ class AgentSystem:
                 assigned = self.orchestrator.distribute_task(task)
 
             if assigned:
+                if task.assigned_to and not self._queue_limiter.try_acquire(task.assigned_to):
+                    logger.warning("Agent %s queue limit reached; task %s rejected", task.assigned_to, task.id)
+                    return False
                 self._set_task_status(task, TaskStatus.ASSIGNED, assigned_to=task.assigned_to, claimed_by=task.assigned_to)
                 self._dequeue_task(task.id)
                 self._emit_event("task_assigned", task)
@@ -711,9 +1315,11 @@ class AgentSystem:
                 return True
 
             logger.warning("Failed to submit task %s", task.id)
+            self._enqueue_if_missing(task)
             return False
 
     def execute_task(self, task_id: str, agent_id: str) -> Any:
+        limited_agent_id = agent_id
         with self._lock:
             agent = self.get_agent(agent_id)
             if not agent:
@@ -721,14 +1327,28 @@ class AgentSystem:
             task = agent.active_tasks.get(task_id)
             if not task:
                 raise KeyError(f"Task {task_id} is not assigned to agent {agent_id}")
-
+            unmet_dependencies = self._get_unmet_dependencies(task)
+            if unmet_dependencies:
+                self.system_metrics["dependency_blocked_tasks"] += 1
+                self._release_task_from_agent(task.id, agent_id)
+                self._set_task_status(task, TaskStatus.PENDING, assigned_to=None, claimed_by=None, completed_at=None)
+                self._enqueue_if_missing(task)
+                self._emit_event("task_dependency_blocked", task, {"dependencies": unmet_dependencies})
+                raise ValueError(f"Task {task.id} blocked by unmet dependencies")
             self._ensure_claimed_by(task, agent_id)
-            self._set_task_status(task, TaskStatus.RUNNING, assigned_to=agent_id, claimed_by=agent_id)
+            self._set_task_status(
+                task, TaskStatus.RUNNING, assigned_to=agent_id, claimed_by=agent_id
+            )
             self._emit_event("task_running", task)
 
         start_time = datetime.now()
         try:
-            result = agent.run_task(task)
+            with _TRACING.start_span(
+                "agent.task.execute",
+                attributes={"agent.id": agent_id, "task.id": task.id, "task.description": task.description},
+            ):
+                with self.performance_tracker.track("agent_task_execution"):
+                    result = self._task_execution_breaker.call(agent.run_task, task)
             with self._lock:
                 self._set_task_status(
                     task,
@@ -741,6 +1361,8 @@ class AgentSystem:
                 )
                 self._append_unique_task(self.completed_tasks, task)
                 self._update_system_metrics(success=True, start_time=start_time)
+                elapsed = (datetime.now() - start_time).total_seconds()
+                _METRICS.record_agent_task(success=True, duration_seconds=elapsed)
                 self._emit_event("task_completed", task)
             return result
         except Exception as exc:
@@ -776,6 +1398,8 @@ class AgentSystem:
                 )
                 self._append_unique_task(self.failed_tasks, task)
                 self._update_system_metrics(success=False, start_time=start_time)
+                elapsed = (datetime.now() - start_time).total_seconds()
+                _METRICS.record_agent_task(success=False, duration_seconds=elapsed)
                 if attempts >= max_attempts:
                     self.dead_letter_queue.append(
                         {
@@ -798,6 +1422,8 @@ class AgentSystem:
                     )
                 self._emit_event("task_failed", task, {"error": str(exc)})
             raise
+        finally:
+            self._queue_limiter.release(limited_agent_id)
 
     def cancel_task(self, task_id: str, reason: Optional[str] = None) -> Task:
         with self._lock:
@@ -805,7 +1431,9 @@ class AgentSystem:
             if task is None:
                 raise KeyError(f"Task not found: {task_id}")
             if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
-                raise ValueError(f"Task {task_id} in status {task.status.value} cannot be cancelled")
+                raise ValueError(
+                    f"Task {task_id} in status {task.status.value} cannot be cancelled"
+                )
 
             original_assigned_to = task.assigned_to
             self._release_task_from_agent(task.id, original_assigned_to)
@@ -936,6 +1564,7 @@ class AgentSystem:
                 remote_task = self._from_stored_task(stored)
                 remote_ver = self._get_task_version(remote_task)
                 if local_ver < remote_ver:
+                    self.system_metrics["persistence_conflicts"] += 1
                     raise RuntimeError(
                         f"Stale task update detected for {task.id}: local={local_ver}, remote={remote_ver}"
                     )
@@ -945,10 +1574,22 @@ class AgentSystem:
                 return
             except Exception as exc:
                 last_exc = exc
+                self.system_metrics["persistence_retry_attempts"] += 1
+                self.system_metrics["persistence_retries"] += 1
+                self._emit_event("task_persistence_retry", task, {"attempt": attempt, "error": str(exc)})
                 if attempt >= self._max_persist_retries:
                     break
-                time.sleep(0.01 * attempt)
+                exponent = min(attempt - 1, self.persistence_backoff_max_exponent)
+                base_delay = min(
+                    self.persistence_backoff_max_seconds,
+                    self.persistence_backoff_min_seconds * (2**exponent),
+                )
+                jitter_factor = (self._retry_random.random() - 0.5) * 2
+                jitter = base_delay * self.persistence_backoff_jitter_ratio * jitter_factor
+                time.sleep(min(self.persistence_backoff_max_seconds, max(0.0, base_delay + jitter)))
 
+        self.system_metrics["persistence_failures"] += 1
+        self._emit_event("task_persistence_terminal_failure", task, {"error": str(last_exc) if last_exc else None})
         logger.exception(
             "Failed to persist task update after retries for task_id=%s assigned_to=%s status=%s",
             task.id,
@@ -983,18 +1624,21 @@ class AgentSystem:
         self._update_task_record(task)
 
     def _set_claim(self, task: Task, claimed_by: Optional[str]) -> None:
-        task.metadata = dict(task.metadata)
+        metadata = self._ensure_task_metadata(task)
         now = datetime.now()
         if claimed_by is None:
-            task.metadata.pop("claimed_by", None)
-            task.metadata.pop("claim_token", None)
-            task.metadata.pop("claim_expires_at", None)
-            task.metadata.pop("claim_heartbeat_at", None)
+            metadata.pop("claimed_by", None)
+            metadata.pop("claim_token", None)
+            metadata.pop("claim_expires_at", None)
+            metadata.pop("claim_heartbeat_at", None)
         else:
-            task.metadata["claimed_by"] = claimed_by
-            task.metadata["claim_token"] = str(uuid.uuid4())
-            task.metadata["claim_heartbeat_at"] = now.isoformat()
-            task.metadata["claim_expires_at"] = datetime.fromtimestamp(now.timestamp() + self.claim_ttl_seconds).isoformat()
+            current_claimed_by = metadata.get("claimed_by")
+            existing_token = metadata.get("claim_token") if current_claimed_by == claimed_by else None
+            expires_at = now + timedelta(seconds=self.claim_ttl_seconds)
+            metadata["claimed_by"] = claimed_by
+            metadata["claim_token"] = existing_token if isinstance(existing_token, str) and existing_token else str(uuid.uuid4())
+            metadata["claim_heartbeat_at"] = now.isoformat()
+            metadata["claim_expires_at"] = expires_at.isoformat()
 
     def _clear_retry_metadata(self, task: Task) -> None:
         if not isinstance(task.metadata, dict):
@@ -1049,17 +1693,14 @@ class AgentSystem:
             self._retry_backlog -= 1
 
     def _ensure_claimed_by(self, task: Task, agent_id: str) -> None:
-        claimed_by = task.metadata.get("claimed_by") if isinstance(task.metadata, dict) else None
-        expires_raw = task.metadata.get("claim_expires_at") if isinstance(task.metadata, dict) else None
-        expires_at: Optional[datetime] = None
-        if isinstance(expires_raw, str):
-            try:
-                expires_at = datetime.fromisoformat(expires_raw)
-            except Exception:
-                expires_at = None
+        metadata = self._ensure_task_metadata(task)
+        claimed_by = metadata.get("claimed_by")
+        expires_at = self._parse_datetime(metadata.get("claim_expires_at"))
         if claimed_by and expires_at and expires_at <= datetime.now():
+            self.system_metrics["claim_validation_failures"] += 1
             raise ValueError(f"Task {task.id} claim expired for {claimed_by}")
         if claimed_by and claimed_by != agent_id:
+            self.system_metrics["claim_validation_failures"] += 1
             raise ValueError(f"Task {task.id} is claimed by {claimed_by}, not {agent_id}")
 
     def _is_recoverable_status(self, status: TaskStatus) -> bool:
@@ -1083,6 +1724,7 @@ class AgentSystem:
         if task.id in self._task_index:
             return
         if len(self._task_index) >= self.max_queue_size:
+            self.system_metrics["queue_overflow_drops"] += 1
             raise OverflowError(f"Task queue full ({self.max_queue_size})")
         generation = self._queue_generations.get(task.id, 0) + 1
         self._queue_generations[task.id] = generation
@@ -1095,8 +1737,214 @@ class AgentSystem:
         self._compact_queue_if_needed()
 
     def _dequeue_task(self, task_id: str) -> None:
-        if task_id in self._task_index:
-            self._task_index.remove(task_id)
+        self._task_index.discard(task_id)
+        # With generation-based invalidation, discarding from _task_index is sufficient;
+        # stale entries are lazily filtered by the global_task_queue property.
+        # Also do an eager compact to keep the backing heap lean.
+        self._compact_queue_if_needed()
+
+    def _pop_next_valid_task_id(self) -> Optional[str]:
+        while self._global_task_queue:
+            queued = heapq.heappop(self._global_task_queue)
+            if not self._is_queue_entry_live(queued):
+                self.system_metrics["queue_stale_pops"] += 1
+                self.system_metrics["queue_stale_entries_pruned"] += 1
+                continue
+            task = self.load_task(queued.id)
+            if task is None or task.status != TaskStatus.PENDING:
+                self._task_index.discard(queued.id)
+                self.system_metrics["queue_stale_pops"] += 1
+                self.system_metrics["queue_stale_entries_pruned"] += 1
+                continue
+            self._task_index.discard(queued.id)
+            return queued.id
+        return None
+
+    def renew_task_claim(self, task_id: str, agent_id: Optional[str] = None) -> bool:
+        """Refresh the lease heartbeat for an assigned or running task."""
+        with self._lock:
+            task = self._find_active_task(task_id) or self.load_task(task_id)
+            if task is None or task.status not in {TaskStatus.ASSIGNED, TaskStatus.RUNNING}:
+                self.system_metrics["claim_renew_failures"] += 1
+                return False
+            metadata = self._ensure_task_metadata(task)
+            claimed_by = metadata.get("claimed_by")
+            if not isinstance(claimed_by, str) or not claimed_by:
+                self.system_metrics["claim_renew_failures"] += 1
+                return False
+            if agent_id is not None and claimed_by != agent_id:
+                self.system_metrics["claim_renew_failures"] += 1
+                return False
+            expires_at = self._parse_datetime(metadata.get("claim_expires_at"))
+            if expires_at is not None and expires_at + timedelta(seconds=self.claim_grace_seconds) <= datetime.now():
+                self.system_metrics["claim_renew_failures"] += 1
+                return False
+            self._set_claim(task, claimed_by)
+            self._update_task_record(task)
+            self._emit_event("task_claim_renewed", task)
+            self.system_metrics["claim_renew_success"] += 1
+            return True
+
+    def _renew_active_claims(self) -> int:
+        renewed = 0
+        with self._lock:
+            now = datetime.now()
+            for agent in self.agents.values():
+                for task in agent.active_tasks.values():
+                    if task.status not in {TaskStatus.ASSIGNED, TaskStatus.RUNNING}:
+                        continue
+                    metadata = self._ensure_task_metadata(task)
+                    claimed_by = metadata.get("claimed_by")
+                    expires_at = self._parse_datetime(metadata.get("claim_expires_at"))
+                    if not isinstance(claimed_by, str) or not claimed_by:
+                        continue
+                    if expires_at is not None and expires_at + timedelta(seconds=self.claim_grace_seconds) <= now:
+                        continue
+                    self._set_claim(task, claimed_by)
+                    self._update_task_record(task)
+                    self._emit_event("task_claim_renewed", task)
+                    renewed += 1
+        return renewed
+
+    def reclaim_expired_claims(self) -> int:
+        """Reclaim expired task leases and return tasks to the pending queue."""
+        with self._lock:
+            reclaimed = 0
+            candidates: Dict[str, Task] = {}
+            for status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
+                for task in self.list_persisted_tasks(status):
+                    candidates[task.id] = task
+            for agent in self.agents.values():
+                for task in agent.active_tasks.values():
+                    candidates[task.id] = task
+
+            now = datetime.now()
+            for task in candidates.values():
+                metadata = self._ensure_task_metadata(task)
+                claimed_by = metadata.get("claimed_by")
+                expires_at = self._parse_datetime(metadata.get("claim_expires_at"))
+                if not isinstance(claimed_by, str) or expires_at is None:
+                    continue
+                if expires_at + timedelta(seconds=self.claim_grace_seconds) > now:
+                    continue
+                self._release_task_from_agent(task.id, task.assigned_to)
+                self._set_task_status(
+                    task,
+                    TaskStatus.PENDING,
+                    assigned_to=None,
+                    claimed_by=None,
+                    result=None,
+                    error="claim expired",
+                    completed_at=None,
+                )
+                self._enqueue_if_missing(task)
+                self.system_metrics["claim_reclaims"] += 1
+                reclaimed += 1
+                self._emit_event("task_claim_reclaimed", task, {"previous_claimed_by": claimed_by})
+            return reclaimed
+
+    def process_next_pending_task(self) -> bool:
+        """Assign and execute the next valid pending task from the queue."""
+        with self._lock:
+            task_id = self._pop_next_valid_task_id()
+            if task_id is None:
+                return False
+            task = self.load_task(task_id)
+            if task is None or task.status != TaskStatus.PENDING:
+                return False
+
+        if not self.submit_task(task):
+            return False
+
+        assigned_to = task.assigned_to
+        if not assigned_to:
+            return False
+        self.execute_task(task.id, assigned_to)
+        return True
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            if not self._pause_event.is_set():
+                self._pause_event.wait(self.worker_poll_interval_seconds)
+                continue
+            try:
+                processed = self.process_next_pending_task()
+            except Exception:
+                logger.exception("Worker loop failed while processing task")
+                processed = False
+            if not processed:
+                self._stop_event.wait(self.worker_poll_interval_seconds)
+
+    def _maintenance_loop(self) -> None:
+        while not self._stop_event.wait(self.claim_sweep_interval_seconds):
+            try:
+                self._renew_active_claims()
+                self.reclaim_expired_claims()
+            except Exception:
+                logger.exception("Maintenance loop failed")
+
+    def start_workers(self, worker_count: int = 1) -> None:
+        """Start background workers and lease maintenance threads."""
+        if worker_count <= 0:
+            raise ValueError("worker_count must be greater than 0")
+        with self._lock:
+            self._stop_event.clear()
+            self._pause_event.set()
+            if self._maintenance_thread is None or not self._maintenance_thread.is_alive():
+                self._maintenance_thread = threading.Thread(
+                    target=self._maintenance_loop,
+                    name=f"{self.name}-maintenance",
+                    daemon=True,
+                )
+                self._maintenance_thread.start()
+            alive_workers = [thread for thread in self._worker_threads if thread.is_alive()]
+            self._worker_threads = alive_workers
+            while len(self._worker_threads) < worker_count:
+                worker = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"{self.name}-worker-{len(self._worker_threads) + 1}",
+                    daemon=True,
+                )
+                worker.start()
+                self._worker_threads.append(worker)
+
+    def stop_workers(self, timeout_seconds: Optional[float] = None) -> None:
+        """Request worker shutdown and optionally wait for threads to stop."""
+        self._stop_event.set()
+        self._pause_event.set()
+        initial_timeout = None if timeout_seconds is None else max(timeout_seconds, 0.0)
+        if self._maintenance_thread is not None:
+            self._maintenance_thread.join(initial_timeout)
+            if not self._maintenance_thread.is_alive():
+                self._maintenance_thread = None
+        remaining = initial_timeout
+        for worker in list(self._worker_threads):
+            start = time.monotonic()
+            worker.join(remaining)
+            if remaining is not None:
+                remaining = max(0.0, remaining - (time.monotonic() - start))
+        self._worker_threads = [thread for thread in self._worker_threads if thread.is_alive()]
+
+    def pause_processing(self) -> None:
+        """Pause worker task consumption without stopping maintenance."""
+        self._pause_event.clear()
+
+    def resume_processing(self) -> None:
+        """Resume worker task consumption after a pause."""
+        self._pause_event.set()
+
+    def drain_and_shutdown(self, timeout_seconds: float = 5.0) -> bool:
+        """Stop workers, wait for active tasks to settle, and persist current state."""
+        timeout_seconds = max(timeout_seconds, 0.0)
+        deadline = time.monotonic() + timeout_seconds
+        self.stop_workers(timeout_seconds=timeout_seconds)
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not any(agent.active_tasks for agent in self.agents.values()):
+                    break
+            time.sleep(0.01)
+        with self._lock:
+            return not any(agent.active_tasks for agent in self.agents.values())
 
     def _is_queue_entry_live(self, entry: TaskQueueEntry) -> bool:
         """Return True when the queue entry is still the current active entry.
@@ -1132,7 +1980,9 @@ class AgentSystem:
         self.system_metrics["completed_tasks_total"] += 1
         total = self.system_metrics["completed_tasks_total"]
         overall_prev = self.system_metrics["avg_task_duration_overall"]
-        self.system_metrics["avg_task_duration_overall"] = overall_prev + ((elapsed - overall_prev) / total)
+        self.system_metrics["avg_task_duration_overall"] = overall_prev + (
+            (elapsed - overall_prev) / total
+        )
         if success:
             n = self.system_metrics["successful_tasks"]
             prev = self.system_metrics["avg_task_duration_success"]
@@ -1154,11 +2004,27 @@ class AgentSystem:
                 "completed_tasks": len(self.completed_tasks),
                 "failed_tasks": len(self.failed_tasks),
                 "dead_letter_tasks": len(self.dead_letter_queue),
+                "processing_paused": not self._pause_event.is_set(),
+                "worker_threads": len([thread for thread in self._worker_threads if thread.is_alive()]),
             }
 
     def get_observability_snapshot(self) -> Dict[str, Any]:
+        perf_snapshot = self.performance_tracker.snapshot()
+        resource_snapshot = self.performance_tracker.resource_snapshot()
+        _METRICS.record_task_system(
+            queue_depth=len(self._task_index),
+            processing_time=float(self.system_metrics.get("avg_task_duration_overall", 0.0)),
+            throughput=float(self.system_metrics.get("completed_tasks_total", 0.0)),
+        )
+        _METRICS.record_resources(
+            memory_usage=resource_snapshot.get("memory_rss_bytes", 0.0),
+            cpu_usage=resource_snapshot.get("cpu_percent", 0.0),
+            model_size=0.0,
+        )
+        metric_snapshot = _METRICS.snapshot()
         return {
             "metrics": _make_json_safe(self.system_metrics),
+            "prometheus_metrics": metric_snapshot,
             "recent_events": self.event_log[-200:],
             "queue_depth": len(self._task_index),
             "dead_letter_depth": len(self.dead_letter_queue),
@@ -1167,6 +2033,12 @@ class AgentSystem:
             "retry_backoff_base_seconds": self.retry_backoff_base_seconds,
             "retry_backoff_max_seconds": self.retry_backoff_max_seconds,
             "recent_dead_letters": list(self.dead_letter_queue)[-20:],
+            "worker_threads": len([thread for thread in self._worker_threads if thread.is_alive()]),
+            "processing_paused": not self._pause_event.is_set(),
+            "health": self.health_checker.run(),
+            "performance": perf_snapshot,
+            "resource_usage": resource_snapshot,
+            "alerts": self.threshold_monitor.evaluate(metrics=metric_snapshot),
         }
 
     def to_json(self) -> str:
@@ -1193,7 +2065,9 @@ class AgentFactory:
         return None
 
     @classmethod
-    def create_team(cls, team_config: Dict[str, int], task_store: Optional[TaskStore] = None) -> AgentSystem:
+    def create_team(
+        cls, team_config: Dict[str, int], task_store: Optional[TaskStore] = None
+    ) -> AgentSystem:
         system = AgentSystem("Ai-morphasis-Team", task_store=task_store)
         for agent_type, count in team_config.items():
             if count < 0:
@@ -1263,5 +2137,7 @@ def example_usage() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
     example_usage()
