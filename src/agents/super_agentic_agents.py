@@ -203,6 +203,7 @@ DEFAULT_CAPABILITY_RETRY_ATTEMPTS = 1
 MAX_CAPABILITY_RETRY_ATTEMPTS = 5
 MAX_RETRY_BACKOFF_SECONDS = 5.0
 MAX_RETRY_EXPONENT = 10
+BASE_RETRY_BACKOFF_SECONDS = 1
 
 DEFAULT_CLAIM_TTL_SECONDS = 60
 DEFAULT_CLAIM_GRACE_SECONDS = 10
@@ -454,9 +455,13 @@ class Task:
     status: TaskStatus = TaskStatus.PENDING
     created_at: datetime = field(default_factory=datetime.now)
     started_at: Optional[datetime] = None
+    last_attempt_at: Optional[datetime] = None
+    next_retry_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     result: Any = None
     error: Optional[str] = None
+    retry_count: int = 0
+    max_retries: int = 0
     parameters: Dict[str, Any] = field(default_factory=dict)
     dependencies: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -545,7 +550,11 @@ class Task:
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
+            "last_attempt_at": self.last_attempt_at.isoformat() if self.last_attempt_at else None,
+            "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "retry_count": self.retry_count,
+            "max_retries": self.max_retries,
             "result": _make_json_safe(self.result),
             "error": self.error,
             "parameters": _make_json_safe(self.parameters),
@@ -910,7 +919,9 @@ class BaseAgent(ABC):
             if task.assigned_to != self.id:
                 raise ValueError(f"Task {task.id} is assigned to {task.assigned_to}, not {self.id}")
             start_time = datetime.now()
-            task.started_at = start_time
+            task.last_attempt_at = start_time
+            if task.started_at is None:
+                task.started_at = start_time
             # Ensure task is in RUNNING state (idempotent if already RUNNING via system.execute_task)
             if task.status != TaskStatus.RUNNING:
                 task.transition_to(TaskStatus.RUNNING)
@@ -922,6 +933,7 @@ class BaseAgent(ABC):
             reasoning = self.think(task.parameters)
             result = self.act(reasoning)
             task.transition_to(TaskStatus.COMPLETED)
+            task.result = result
             task.completed_at = datetime.now()
             self._record_task_outcome(task, success=True, start_time=start_time)
             logger.info("Task %s completed successfully", task.id)
@@ -1296,6 +1308,7 @@ class AgentSystem:
         self.event_log: List[Dict[str, Any]] = []
         self.max_events = 10000
         self._idempotency_index: Dict[str, str] = {}
+        self._live_task_refs: Dict[str, Task] = {}
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()
@@ -1542,6 +1555,7 @@ class AgentSystem:
             self.system_metrics["total_tasks"] += 1
             self.metrics.tasks_created.increment()
             self._store_task(task)
+            self._live_task_refs[task.id] = task
             self._emit_event("task_created", task)
             logger.info("Task %s created: %s", task.id, description)
             return task
@@ -1703,6 +1717,111 @@ class AgentSystem:
             raise
         finally:
             self._queue_limiter.release(limited_agent_id)
+
+    def process_task(self, task_id: str, agent_id: Optional[str] = None) -> bool:
+        """Synchronously process a pending task with task-level retry support.
+
+        Finds the task in the pending queue, assigns it to the specified agent
+        (or the orchestrator), executes it, and either records terminal
+        success/failure or re-queues for retry when retries remain.
+
+        Args:
+            task_id: ID of the task to process.
+            agent_id: Optional ID of the agent to assign the task to.
+
+        Returns:
+            True if the task completed successfully, False otherwise.
+        """
+        with self._lock:
+            if task_id not in self._task_index:
+                logger.warning("Task %s not found in pending queue", task_id)
+                return False
+
+        # Prefer the live in-process task object to preserve caller references.
+        task = self._live_task_refs.get(task_id) or self.load_task(task_id)
+        if task is None:
+            logger.warning("Task %s could not be loaded", task_id)
+            return False
+
+        target_agent: Optional[BaseAgent] = None
+        if agent_id:
+            target_agent = self.get_agent(agent_id)
+            if target_agent is None:
+                raise ValueError(f"Agent '{agent_id}' not found")
+            if not target_agent.assign_task(task):
+                logger.warning("Unable to assign task %s to agent %s", task_id, agent_id)
+                return False
+        else:
+            if not self.orchestrator.distribute_task(task) or not task.assigned_to:
+                logger.warning("Unable to assign task %s via orchestrator", task_id)
+                return False
+            target_agent = self.get_agent(task.assigned_to)
+            if target_agent is None:
+                return False
+
+        start_time = datetime.now()
+        try:
+            result = target_agent.run_task(task)
+            task.result = result
+            with self._lock:
+                self._dequeue_task(task_id)
+                self._live_task_refs.pop(task_id, None)
+                self._append_unique_task(self.completed_tasks, task)
+                self._update_system_metrics(success=True, start_time=start_time)
+            return True
+        except Exception:
+            logger.exception("Task %s execution failed on agent %s", task_id, target_agent.id)
+            if task.retry_count < task.max_retries:
+                task.retry_count += 1
+                backoff_seconds = BASE_RETRY_BACKOFF_SECONDS * max(1, task.retry_count)
+                task.next_retry_at = datetime.now() + timedelta(seconds=backoff_seconds)
+                if isinstance(task.metadata, dict):
+                    task.metadata["retry_backoff_seconds"] = backoff_seconds
+                task.transition_to(TaskStatus.PENDING)
+                task.assigned_to = None
+                task.completed_at = None
+                task.error = None
+                return False
+            with self._lock:
+                self._dequeue_task(task_id)
+                self._live_task_refs.pop(task_id, None)
+                self._append_unique_task(self.completed_tasks, task)
+                self._update_system_metrics(success=False, start_time=start_time)
+            return False
+
+    def process_pending_tasks(self, max_tasks: Optional[int] = None) -> Dict[str, Any]:
+        """Process all pending tasks in the queue synchronously.
+
+        Args:
+            max_tasks: Optional limit on the number of tasks to process.
+
+        Returns:
+            A summary dict with keys: processed, successful, failed, remaining_pending.
+        """
+        processed = 0
+        successful = 0
+        terminal_failures = 0
+        task_ids = [entry.id for entry in self.global_task_queue]
+
+        for task_id in task_ids:
+            if max_tasks is not None and processed >= max_tasks:
+                break
+            result = self.process_task(task_id)
+            processed += 1
+            if result:
+                successful += 1
+            else:
+                with self._lock:
+                    in_queue = task_id in self._task_index
+                if not in_queue:
+                    terminal_failures += 1
+
+        return {
+            "processed": processed,
+            "successful": successful,
+            "failed": terminal_failures,
+            "remaining_pending": len(self.global_task_queue),
+        }
 
     def cancel_task(self, task_id: str, reason: Optional[str] = None) -> Task:
         with self._lock:
