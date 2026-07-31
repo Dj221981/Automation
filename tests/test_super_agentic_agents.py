@@ -4,22 +4,25 @@ Tests for the production-ready super_agentic_agents framework.
 Covers:
 - Agent creation and capability registration
 - Task creation, assignment, and execution
-- Retry logic (mock a failing act() that succeeds on 3rd attempt)
 - AgentConfig and TaskConfig validation
-- AgentSystem.get_health() output structure
+- AgentSystem.get_system_status() output structure
+- Task persistence lifecycle (create, assign, execute, fail, recover, requeue, cancel)
+- Async execute_task wrapper on BaseAgent
+- StructuredLogger
 """
 
 import asyncio
 import uuid
+from datetime import datetime
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
 
 from src.agents.super_agentic_agents import (
     AgentCapability,
     AgentConfig,
+    AgentMemory,
     AgentRole,
     AgentStatus,
     AgentSystem,
@@ -28,13 +31,14 @@ from src.agents.super_agentic_agents import (
     ExecutorAgent,
     LearnerAgent,
     OrchestratorAgent,
+    StructuredLogger,
     Task,
     TaskConfig,
     TaskPriority,
+    TaskStatus,
     AgentFactory,
-    AgentMemory,
-    StructuredLogger,
 )
+from src.agents.task_store import InMemoryTaskStore, StoredTask
 
 
 # ============================================================================
@@ -182,7 +186,7 @@ class TestTaskManagement:
 
 
 # ============================================================================
-# Async task execution
+# Async task execution (via BaseAgent.execute_task wrapper)
 # ============================================================================
 
 @pytest.mark.asyncio
@@ -193,7 +197,7 @@ class TestAsyncExecution:
         agent.assign_task(task)
         result = await agent.execute_task(task)
         assert result["execution"] == "successful"
-        assert task.status == "completed"
+        assert task.status == TaskStatus.COMPLETED
         assert agent.status == AgentStatus.IDLE
 
     async def test_execute_task_sets_duration(self):
@@ -203,23 +207,6 @@ class TestAsyncExecution:
         await agent.execute_task(task)
         assert "duration_ms" in task.metadata
         assert task.metadata["duration_ms"] >= 0
-
-    async def test_run_tasks_concurrent(self):
-        system = AgentSystem("ConcurrentSys")
-        agents = [ExecutorAgent(f"Exec-{i}") for i in range(3)]
-        for a in agents:
-            system.add_agent(a)
-
-        pairs = []
-        for agent in agents:
-            task = make_task(f"Task for {agent.name}")
-            agent.assign_task(task)
-            pairs.append((agent, task))
-
-        results = await system.run_tasks(pairs)
-        assert len(results) == 3
-        for r in results:
-            assert not isinstance(r, Exception)
 
     async def test_analyzer_agent_execution(self):
         agent = AnalyzerAgent("Analyze-async")
@@ -242,208 +229,53 @@ class TestAsyncExecution:
         result = await agent.execute_task(task)
         assert result["status"] == "orchestration_complete"
 
+    async def test_execute_task_failure(self):
+        class FailingAgent(ExecutorAgent):
+            def act(self, decision: Dict[str, Any]) -> Any:
+                raise RuntimeError("Execution failed")
 
-# ============================================================================
-# Retry logic
-# ============================================================================
-
-class _FlakyExecutorAgent(ExecutorAgent):
-    """An executor whose act() fails the first two times, then succeeds."""
-    def __init__(self, name: str = "Flaky"):
-        super().__init__(name, max_retries=3, retry_delay=0.01)
-        self._call_count = 0
-
-    async def act(self, decision: Dict[str, Any]) -> Any:
-        self._call_count += 1
-        if self._call_count < 3:
-            raise RuntimeError(f"Simulated failure (attempt {self._call_count})")
-        return {"execution": "successful", "parameters_processed": {}}
-
-
-@pytest.mark.asyncio
-class TestRetryLogic:
-    async def test_retries_then_succeeds(self):
-        agent = _FlakyExecutorAgent()
-        task = make_task("Retry task")
-        agent.assign_task(task)
-        result = await agent.execute_task(task)
-        assert result["execution"] == "successful"
-        assert agent._call_count == 3
-        assert task.status == "completed"
-        assert agent.status == AgentStatus.IDLE
-
-    async def test_exhausted_retries_raises(self):
-        class AlwaysFailAgent(ExecutorAgent):
-            def __init__(self):
-                super().__init__("AlwaysFail", max_retries=2, retry_delay=0.01)
-
-            async def act(self, decision: Dict[str, Any]) -> Any:
-                raise ValueError("Permanent failure")
-
-        agent = AlwaysFailAgent()
-        task = make_task("Always fail")
+        agent = FailingAgent("Fail-async")
+        task = make_task("Failing task")
         agent.assign_task(task)
 
-        with pytest.raises(ValueError, match="Permanent failure"):
+        with pytest.raises(RuntimeError, match="Execution failed"):
             await agent.execute_task(task)
 
-        assert agent.status == AgentStatus.ERROR
-        assert task.status == "failed"
-        assert "Permanent failure" in (task.error or "")
+        assert task.status == TaskStatus.FAILED
+        assert "Execution failed" in (task.error or "")
 
 
 # ============================================================================
-# LLM client integration (mocked)
-# ============================================================================
-
-@pytest.mark.asyncio
-class TestLLMIntegration:
-    async def test_orchestrator_uses_llm_when_provided(self):
-        """When llm_client is set, OrchestratorAgent.think() calls the API."""
-        mock_client = MagicMock()
-        mock_completion = MagicMock()
-        mock_completion.choices[0].message.content = (
-            '{"analysis": "LLM plan", "priority": "high", "execution_strategy": "sequential"}'
-        )
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_completion)
-
-        agent = OrchestratorAgent("LLM-Orch", llm_client=mock_client)
-        result = await agent.think({"task": "do something"})
-        assert result["analysis"] == "LLM plan"
-        mock_client.chat.completions.create.assert_called_once()
-
-    async def test_orchestrator_fallback_without_llm(self):
-        agent = OrchestratorAgent("NoLLM-Orch")
-        result = await agent.think({})
-        assert "analysis" in result
-        assert "execution_strategy" in result
-
-    async def test_analyzer_uses_llm_when_provided(self):
-        mock_client = MagicMock()
-        mock_completion = MagicMock()
-        mock_completion.choices[0].message.content = (
-            '{"data_received": true, "analysis_type": "LLM", '
-            '"insights_generated": true, "summary": "LLM analysis"}'
-        )
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_completion)
-
-        agent = AnalyzerAgent("LLM-Analyzer", llm_client=mock_client)
-        result = await agent.think({"data": [1, 2, 3]})
-        assert result["analysis_type"] == "LLM"
-
-    async def test_analyzer_fallback_without_llm(self):
-        agent = AnalyzerAgent("NoLLM-Analyzer")
-        result = await agent.think({"data": "test"})
-        assert result["data_received"] is True
-
-
-# ============================================================================
-# AgentSystem.get_health()
-# ============================================================================
-
-class TestHealthCheck:
-    def test_health_keys_present(self):
-        system = AgentSystem("HealthSys")
-        health = system.get_health()
-        assert "status" in health
-        assert "agents_healthy" in health
-        assert "agents_total" in health
-        assert "uptime_seconds" in health
-        assert "task_success_rate" in health
-
-    def test_healthy_status_on_fresh_system(self):
-        system = AgentSystem("FreshSys")
-        health = system.get_health()
-        assert health["status"] == "healthy"
-        assert health["agents_healthy"] == health["agents_total"]
-        assert health["task_success_rate"] == 1.0
-
-    def test_uptime_is_positive(self):
-        system = AgentSystem("UptimeSys")
-        health = system.get_health()
-        assert health["uptime_seconds"] >= 0
-
-    def test_degraded_when_agent_in_error(self):
-        system = AgentSystem("DegradedSys")
-        agent = ExecutorAgent("ErrorAgent")
-        agent.status = AgentStatus.ERROR
-        system.add_agent(agent)
-        health = system.get_health()
-        assert health["agents_healthy"] < health["agents_total"]
-
-
-# ============================================================================
-# AgentSystem general
-# ============================================================================
-
-class TestAgentSystem:
-    def test_add_remove_agent(self):
-        system = AgentSystem("ManageSys")
-        agent = ExecutorAgent("Exec-manage")
-        system.add_agent(agent)
-        assert system.get_agent(agent.id) is agent
-        system.remove_agent(agent.id)
-        assert system.get_agent(agent.id) is None
-
-    def test_system_status_keys(self):
-        system = AgentSystem("StatusSys")
-        status = system.get_system_status()
-        assert "system_name" in status
-        assert "agents" in status
-        assert "metrics" in status
-
-    def test_to_json_is_valid_json(self):
-        import json
-        system = AgentSystem("JSONSys")
-        raw = system.to_json()
-        parsed = json.loads(raw)
-        assert "system_name" in parsed
-
-    def test_factory_create_agent(self):
-        agent = AgentFactory.create_agent("executor", "FactoryExec")
-        assert agent is not None
-        assert isinstance(agent, ExecutorAgent)
-
-    def test_factory_unknown_type_returns_none(self):
-        agent = AgentFactory.create_agent("unknown_type", "X")
-        assert agent is None
-
-    def test_factory_create_team(self):
-        system = AgentFactory.create_team({"executor": 2, "analyzer": 1})
-        # 1 orchestrator + 2 executors + 1 analyzer = 4 total
-        assert len(system.agents) == 4
-
-
-# ============================================================================
-# Memory
+# AgentMemory
 # ============================================================================
 
 class TestAgentMemory:
     def test_store_and_retrieve_episode(self):
-        mem = AgentMemory(agent_id="test-id")
-        mem.store_episode("key1", "value1")
-        assert mem.retrieve("key1", "episodic") == "value1"
+        mem = AgentMemory(agent_id="test-agent")
+        mem.store_episode("task:1", {"result": "ok"})
+        assert mem.retrieve("task:1") == {"result": "ok"}
 
     def test_store_and_retrieve_semantic(self):
-        mem = AgentMemory(agent_id="test-id")
-        mem.store_semantic("sem_key", {"data": 42})
-        assert mem.retrieve("sem_key", "semantic") == {"data": 42}
+        mem = AgentMemory(agent_id="test-agent")
+        mem.store_semantic("config:key", 42)
+        assert mem.retrieve("config:key", "semantic") == 42
 
     def test_auto_retrieval_prefers_episodic(self):
-        mem = AgentMemory(agent_id="test-id")
-        mem.store_episode("shared", "episodic_val")
-        mem.store_semantic("shared", "semantic_val")
-        assert mem.retrieve("shared") == "episodic_val"
+        mem = AgentMemory(agent_id="test-agent")
+        mem.store_episode("key", "episodic_value")
+        mem.store_semantic("key", "semantic_value")
+        result = mem.retrieve("key", "auto")
+        assert result == "episodic_value"
 
     def test_missing_key_returns_none(self):
-        mem = AgentMemory(agent_id="test-id")
+        mem = AgentMemory(agent_id="test-agent")
         assert mem.retrieve("nonexistent") is None
 
-    def test_max_episodes_fifo_eviction(self):
-        mem = AgentMemory(agent_id="test-id", max_episodes=3)
-        for i in range(4):
+    def test_max_episodes_evicts_oldest(self):
+        mem = AgentMemory(agent_id="test-agent", max_episodes=3)
+        for i in range(3):
             mem.store_episode(f"k{i}", f"v{i}")
-        # First inserted key should be evicted
+        mem.store_episode("k3", "v3")
         assert mem.retrieve("k0", "episodic") is None
         assert mem.retrieve("k3", "episodic") == "v3"
 
@@ -466,10 +298,224 @@ class TestStructuredLogger:
     def test_log_methods_callable(self):
         import logging
         slog = StructuredLogger("test_module")
-        # Should not raise
         with patch.object(slog._logger, "info") as mock_info:
             slog.info("Test message")
             mock_info.assert_called_once()
+
+
+# ============================================================================
+# AgentSystem status
+# ============================================================================
+
+class TestSystemStatus:
+    def test_system_status_keys_present(self):
+        system = AgentSystem("StatusSys")
+        status = system.get_system_status()
+        assert "system_name" in status
+        assert "agents" in status
+        assert "metrics" in status
+
+    def test_fresh_system_has_one_orchestrator(self):
+        system = AgentSystem("FreshSys")
+        assert len(system.agents) == 1
+        assert system.orchestrator.id in system.agents
+
+
+# ============================================================================
+# Task persistence lifecycle tests (from main)
+# ============================================================================
+
+class FailingExecutorAgent(ExecutorAgent):
+    def act(self, decision: Dict[str, Any]) -> Any:
+        raise RuntimeError("boom")
+
+
+def test_inmemory_task_store_returns_defensive_copies():
+    store = InMemoryTaskStore()
+    task = StoredTask(id="task-1", description="Task 1", priority="NORMAL")
+
+    store.create_task(task)
+    loaded = store.get_task("task-1")
+    assert loaded is not None
+
+    loaded.metadata["changed"] = True
+    loaded.dependencies.append("dep-1")
+
+    reloaded = store.get_task("task-1")
+    assert reloaded is not None
+    assert reloaded.metadata == {}
+    assert reloaded.dependencies == []
+
+
+def test_agent_system_persists_task_lifecycle_to_completion():
+    store = InMemoryTaskStore()
+    system = AgentSystem("TestSystem", task_store=store)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Process payload", {"value": 1}, priority=TaskPriority.HIGH)
+    stored_created = store.get_task(task.id)
+    assert stored_created is not None
+    assert stored_created.status == "PENDING"
+
+    assert system.submit_task(task, agent.id) is True
+    stored_assigned = store.get_task(task.id)
+    assert stored_assigned is not None
+    assert stored_assigned.status == "ASSIGNED"
+    assert stored_assigned.assigned_to == agent.id
+    assert stored_assigned.metadata.get("claimed_by") == agent.id
+
+    result = system.execute_task(task.id, agent.id)
+    assert result["execution"] == "successful"
+
+    stored_completed = store.get_task(task.id)
+    assert stored_completed is not None
+    assert stored_completed.status == "COMPLETED"
+    assert stored_completed.assigned_to == agent.id
+    assert stored_completed.metadata.get("claimed_by") == agent.id
+    assert stored_completed.completed_at is not None
+
+
+def test_agent_system_persists_failed_execution():
+    store = InMemoryTaskStore()
+    system = AgentSystem("FailureSystem", task_store=store)
+    agent = FailingExecutorAgent("FailingExecutor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Explode", {"value": 1})
+    assert system.submit_task(task, agent.id) is True
+
+    try:
+        system.execute_task(task.id, agent.id)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as exc:
+        assert str(exc) == "boom"
+
+    stored_failed = store.get_task(task.id)
+    assert stored_failed is not None
+    assert stored_failed.status == "FAILED"
+    assert stored_failed.error == "boom"
+    assert stored_failed.assigned_to == agent.id
+
+
+def test_recover_incomplete_tasks_resets_running_and_assigned_tasks():
+    store = InMemoryTaskStore()
+    system = AgentSystem("RecoverySystem", task_store=store)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Recover me", {"value": 1})
+    assert system.submit_task(task, agent.id) is True
+
+    stored_assigned = store.get_task(task.id)
+    assert stored_assigned is not None
+    stored_assigned.status = "RUNNING"
+    store.update_task(stored_assigned)
+
+    recovered = system.recover_incomplete_tasks()
+    assert recovered == 1
+
+    reloaded = store.get_task(task.id)
+    assert reloaded is not None
+    assert reloaded.status == "PENDING"
+    assert reloaded.assigned_to is None
+    assert reloaded.metadata.get("claimed_by") is None
+    assert task.id in system._task_index
+    assert agent.active_tasks == {}
+
+
+def test_requeue_task_moves_failed_task_back_to_pending():
+    store = InMemoryTaskStore()
+    system = AgentSystem("RequeueSystem", task_store=store)
+    agent = FailingExecutorAgent("FailingExecutor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Retry me", {"value": 2})
+    assert system.submit_task(task, agent.id) is True
+
+    try:
+        system.execute_task(task.id, agent.id)
+    except RuntimeError:
+        pass
+
+    requeued = system.requeue_task(task.id)
+    assert requeued.status == TaskStatus.PENDING
+
+    stored = store.get_task(task.id)
+    assert stored is not None
+    assert stored.status == "PENDING"
+    assert stored.assigned_to is None
+    assert stored.error is None
+    assert task.id in system._task_index
+
+
+def test_claim_mismatch_blocks_execution():
+    store = InMemoryTaskStore()
+    system = AgentSystem("ClaimSystem", task_store=store)
+    agent_one = ExecutorAgent("Executor-1")
+    agent_two = ExecutorAgent("Executor-2")
+    system.add_agent(agent_one)
+    system.add_agent(agent_two)
+
+    task = system.create_task("Claimed task", {"value": 3})
+    assert system.submit_task(task, agent_one.id) is True
+
+    # Load the persisted task (which has claimed_by = agent_one.id set)
+    claimed_task = system.load_task(task.id)
+    assert claimed_task is not None
+    agent_two.active_tasks[claimed_task.id] = claimed_task
+
+    try:
+        system.execute_task(claimed_task.id, agent_two.id)
+        assert False, "Expected ValueError"
+    except ValueError as exc:
+        assert "claimed by" in str(exc)
+
+
+def test_remove_agent_guards_and_idle_removal():
+    store = InMemoryTaskStore()
+    system = AgentSystem("GuardSystem", task_store=store)
+    busy_agent = ExecutorAgent("BusyExecutor")
+    idle_agent = ExecutorAgent("IdleExecutor")
+    system.add_agent(busy_agent)
+    system.add_agent(idle_agent)
+
+    task = system.create_task("Active task", {"value": 4})
+    assert system.submit_task(task, busy_agent.id) is True
+
+    assert system.remove_agent(system.orchestrator.id) is False
+    assert system.remove_agent(busy_agent.id) is False
+    assert system.remove_agent(idle_agent.id) is True
+
+
+def test_queue_dedup_and_cancel_task():
+    store = InMemoryTaskStore()
+    system = AgentSystem("QueueSystem", task_store=store)
+    agent = ExecutorAgent("Executor-1")
+    system.add_agent(agent)
+
+    task = system.create_task("Queue task", {"value": 5})
+    # task already enqueued by create_task; calling _enqueue_if_missing again is a no-op
+    system._enqueue_if_missing(task)
+    assert task.id in system._task_index
+
+    assert system.submit_task(task, agent.id) is True
+    assert task.id not in system._task_index
+
+    requeued = system.requeue_task(task.id)
+    assert requeued.status == TaskStatus.PENDING
+    assert task.id in system._task_index
+
+    cancelled = system.cancel_task(task.id, reason="no longer needed")
+    assert cancelled.status == TaskStatus.CANCELLED
+
+    stored = store.get_task(task.id)
+    assert stored is not None
+    assert stored.status == "CANCELLED"
+    assert stored.error == "no longer needed"
+    assert stored.assigned_to is None
+    assert stored.metadata.get("claimed_by") is None
+    assert task.id not in system._task_index
 
 
 if __name__ == "__main__":

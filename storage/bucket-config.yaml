@@ -1,116 +1,122 @@
 # Storage Bucket Configuration for Agentic Agents Memory
-# This configuration defines storage buckets for different agent types and memory layers
+# This configuration defines storage buckets for different agent types and memory layers.
+#
+# Python-friendly notes:
+# - This file is YAML and remains compatible with modern Python loaders such as PyYAML.
+# - The structure below is normalized so a Python 3.12+ application can validate and consume it
+#   without relying on mixed mapping/list shapes under the same key.
+
+schema_version: 1
+python_min_version: "3.12"
+description: Storage bucket configuration for agent memory, cache, archive, and backups
+
+# Shared defaults applied by consumers when specific values are omitted.
+defaults:
+  environment: production
+  managed_by: ai-morphasis
+  encryption: true
+  access_level: private
+  versioning: true
+
+# Logical mappings from runtime data types to storage tiers.
+bucket_roles:
+  episodic_memory: agent_cache
+  semantic_memory: agent_memory
+  procedural_memory: agent_archive
+  backups: agent_backups
 
 buckets:
-  # Primary agent memory storage
   agent_memory:
-    name: "ai-morphasis-agent-memory"
-    type: "primary"
-    description: "Core memory storage for all agentic agents"
+    name: ai-morphasis-agent-memory
+    type: primary
+    description: Core memory storage for all agentic agents
     retention_days: 365
-    versioning: true
-    encryption: true
     replicas: 3
-    access_level: "private"
     regions:
-      - "us-east-1"
-      - "eu-west-1"
+      - us-east-1
+      - eu-west-1
     tags:
-      environment: "production"
-      purpose: "agent-memory"
-      managed_by: "ai-morphasis"
+      purpose: agent-memory
 
-  # Short-term cache for active agents
   agent_cache:
-    name: "ai-morphasis-agent-cache"
-    type: "cache"
-    description: "Temporary cache storage for active agent sessions"
-    retention_days: 30
+    name: ai-morphasis-agent-cache
+    type: cache
+    description: Temporary cache storage for active agent sessions
+    retention_days: 7
     versioning: false
-    encryption: true
     replicas: 2
-    access_level: "private"
     regions:
-      - "us-east-1"
+      - us-east-1
     tags:
-      environment: "production"
-      purpose: "agent-cache"
-      managed_by: "ai-morphasis"
+      purpose: agent-cache
 
-  # Archive storage for historical data
   agent_archive:
-    name: "ai-morphasis-agent-archive"
-    type: "archive"
-    description: "Long-term archive storage for agent memory and history"
-    retention_days: 2555  # ~7 years
-    versioning: true
-    encryption: true
+    name: ai-morphasis-agent-archive
+    type: archive
+    description: Long-term archive storage for agent memory and history
+    retention_days: 2555
+    storage_class: archive
     replicas: 2
-    access_level: "restricted"
-    storage_class: "glacier"
+    access_level: restricted
     regions:
-      - "us-east-1"
+      - us-east-1
+    immutability:
+      enabled: true
+      mode: compliance
     tags:
-      environment: "production"
-      purpose: "agent-archive"
-      managed_by: "ai-morphasis"
+      purpose: agent-archive
 
-  # Backup storage for disaster recovery
   agent_backups:
-    name: "ai-morphasis-agent-backups"
-    type: "backup"
-    description: "Backup storage for disaster recovery"
+    name: ai-morphasis-agent-backups
+    type: backup
+    description: Backup storage for disaster recovery
     retention_days: 90
-    versioning: true
-    encryption: true
     replicas: 3
-    cross_region_replication: true
-    access_level: "restricted"
+    cross_region_replication:
+      enabled: true
+      regions:
+        - us-west-2
+        - eu-west-1
+    access_level: restricted
     regions:
-      - "us-east-1"
-      - "us-west-2"
-      - "eu-west-1"
+      - us-east-1
+      - us-west-2
+      - eu-west-1
     tags:
-      environment: "production"
-      purpose: "agent-backup"
-      managed_by: "ai-morphasis"
+      purpose: agent-backup
 
-  # Agent-specific memory buckets
-  agent_specific:
-    - name: "ai-morphasis-reasoning-agent"
-      agent_type: "reasoning"
-      description: "Memory for reasoning and decision-making agents"
-      retention_days: 365
-      purpose: "Stores thought chains, inference logs, and decision history"
-      
-    - name: "ai-morphasis-learning-agent"
-      agent_type: "learning"
-      description: "Memory for learning and adaptation"
-      retention_days: 365
-      purpose: "Stores training data, model weights, and improvement logs"
-      
-    - name: "ai-morphasis-orchestration-agent"
-      agent_type: "orchestration"
-      description: "Memory for task orchestration and coordination"
-      retention_days: 180
-      purpose: "Stores task states, coordination logs, and workflow data"
-      
-    - name: "ai-morphasis-perception-agent"
-      agent_type: "perception"
-      description: "Memory for perception and analysis"
-      retention_days: 90
-      purpose: "Stores input processing, analysis results, and sensor data"
+# Agent-to-bucket policy for runtime consumers.
+agent_profiles:
+  reasoning:
+    bucket: agent_archive
+    retention_days: 365
+    purpose: Stores thought chains, inference logs, and decision history
 
-# Access policies
+  learning:
+    bucket: agent_memory
+    retention_days: 365
+    purpose: Stores training data, model weights, and improvement logs
+
+  orchestration:
+    bucket: agent_cache
+    retention_days: 180
+    purpose: Stores task states, coordination logs, and workflow data
+
+  perception:
+    bucket: agent_cache
+    retention_days: 90
+    purpose: Stores input processing, analysis results, and sensor data
+
 access_policies:
   public_read: false
   authenticated_only: true
   encryption_required: true
   mfa_required_for_deletion: true
   audit_logging: true
-  object_lock: true  # Compliance mode for audit trails
+  object_lock:
+    enabled: true
+    mode: compliance
 
-# Monitoring and alerts
 monitoring:
   enabled: true
   metrics:
@@ -119,7 +125,17 @@ monitoring:
     - error_rates
     - latency
   alerts:
-    - high_storage_usage: "90%"
-    - access_anomaly: true
-    - failed_requests: ">100/hour"
-    - encryption_failures: true
+    high_storage_usage:
+      threshold: 90
+      unit: percent
+      severity: warning
+    access_anomaly:
+      enabled: true
+      severity: high
+    failed_requests:
+      threshold: 100
+      unit: per_hour
+      severity: critical
+    encryption_failures:
+      enabled: true
+      severity: critical
