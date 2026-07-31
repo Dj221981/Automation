@@ -1,21 +1,19 @@
 ---
 name: Feature request
-about: Suggest an enhancement
+about: Suggest an idea for this project
+title: "[Feature] "
 labels: enhancement
+assignees: ""
 ---
 
 ## Motivation
+Describe the problem or opportunity this feature addresses.
 
-What problem or opportunity does this feature address?
+## Proposed Solution
+Describe the feature you would like to see.
 
-## Proposed solution
+## Alternatives Considered
+Describe any alternative solutions or features you've considered.
 
-Describe the feature and expected behavior.
-
-## Alternatives considered
-
-List any alternative approaches you've evaluated.
-
-## Additional context
-
-Add supporting details, links, or examples.
+## Additional Context
+Add any other context, mockups, or references here.
