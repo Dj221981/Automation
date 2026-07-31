@@ -452,6 +452,7 @@ class Task:
     assigned_to: Optional[str] = None
     status: TaskStatus = TaskStatus.PENDING
     created_at: datetime = field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     result: Any = None
     error: Optional[str] = None
@@ -460,8 +461,79 @@ class Task:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.description.strip():
-            raise ValueError("Task description cannot be empty")
+        if not isinstance(self.description, str) or not self.description.strip():
+            raise ValueError("Task description must be a non-empty string")
+        self.description = self.description.strip()
+        if not isinstance(self.parameters, dict):
+            raise TypeError("Task parameters must be a dictionary")
+        if not isinstance(self.metadata, dict):
+            raise TypeError("Task metadata must be a dictionary")
+        if not isinstance(self.dependencies, list):
+            raise TypeError("Task dependencies must be a list")
+        normalized: List[str] = []
+        for dep in self.dependencies:
+            if not isinstance(dep, str) or not dep.strip():
+                raise ValueError("Task dependency identifiers must be non-empty strings")
+            dep_id = dep.strip()
+            if dep_id not in normalized:
+                normalized.append(dep_id)
+        self.dependencies = normalized
+        status_history = list(self.metadata.get("status_history", []))
+        if not status_history:
+            status_history.append({
+                "from": None,
+                "to": self.status.value,
+                "timestamp": self._timestamp(),
+            })
+            self.metadata["status_history"] = status_history
+
+    @staticmethod
+    def _timestamp() -> str:
+        """Return a consistent ISO-formatted timestamp for task events."""
+        return datetime.now().isoformat()
+
+    @property
+    def status_value(self) -> str:
+        """Return the string value of the current task status."""
+        return self.status.value
+
+    def is_terminal(self) -> bool:
+        """Return whether the task has reached a terminal state."""
+        return self.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+
+    def transition_to(self, new_status: TaskStatus) -> None:
+        """Move the task to a new valid lifecycle state, recording history."""
+        if new_status == self.status:
+            return
+        _allowed: Dict[TaskStatus, Set[TaskStatus]] = {
+            TaskStatus.PENDING: {TaskStatus.ASSIGNED, TaskStatus.CANCELLED, TaskStatus.DEPENDENCY_BLOCKED},
+            TaskStatus.ASSIGNED: {TaskStatus.RUNNING, TaskStatus.PENDING, TaskStatus.CANCELLED},
+            TaskStatus.RUNNING: {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.PENDING, TaskStatus.CANCELLED},
+            TaskStatus.FAILED: {TaskStatus.PENDING},
+            TaskStatus.DEPENDENCY_BLOCKED: {TaskStatus.PENDING},
+            TaskStatus.COMPLETED: set(),
+            TaskStatus.CANCELLED: set(),
+        }
+        if new_status not in _allowed.get(self.status, set()):
+            raise ValueError(
+                f"Illegal task transition: {self.status.value} -> {new_status.value}"
+            )
+        previous = self.status
+        self.status = new_status
+        history = self.metadata.get("status_history") if isinstance(self.metadata, dict) else None
+        if isinstance(history, list):
+            history.append({
+                "from": previous.value,
+                "to": new_status.value,
+                "timestamp": self._timestamp(),
+            })
+
+    def duration_seconds(self) -> Optional[float]:
+        """Return task execution duration in seconds when available."""
+        if self.started_at and self.completed_at:
+            duration = (self.completed_at - self.started_at).total_seconds()
+            return max(duration, 0.0)
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -471,6 +543,7 @@ class Task:
             "assigned_to": self.assigned_to,
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "result": _make_json_safe(self.result),
             "error": self.error,
@@ -584,13 +657,13 @@ class BaseAgent(ABC):
         redis_url: Optional[str] = None,
         llm_client: Optional[Any] = None,
     ):
-        if not name.strip():
-            raise ValueError("Agent name cannot be empty")
-        if max_capabilities <= 0:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Agent name cannot be empty or whitespace-only")
+        if not isinstance(max_capabilities, int) or max_capabilities <= 0:
             raise ValueError("max_capabilities must be greater than 0")
 
         self.id = str(uuid.uuid4())
-        self.name = name
+        self.name = name.strip()
         self.role = role
         self.status = AgentStatus.IDLE
         self.created_at = datetime.now()
@@ -607,6 +680,7 @@ class BaseAgent(ABC):
         self.parent_agent: Optional[str] = None
         self.child_agents: Set[str] = set()
         self.peer_agents: Set[str] = set()
+        self.system: Optional["AgentSystem"] = None
         self._lock = threading.RLock()
         self.safety_mode = True
         self._capability_call_log: Dict[str, List[datetime]] = {}
@@ -772,6 +846,15 @@ class BaseAgent(ABC):
 
     def assign_task(self, task: Task) -> bool:
         with self._lock:
+            if not isinstance(task, Task):
+                raise TypeError("task must be a Task instance")
+            if task.is_terminal():
+                logger.warning(
+                    "Task %s is not assignable because it is in terminal status %s",
+                    task.id,
+                    task.status.value,
+                )
+                return False
             if task.status not in {TaskStatus.PENDING, TaskStatus.ASSIGNED}:
                 logger.warning(
                     "Task %s is not assignable because it is in status %s",
@@ -788,7 +871,7 @@ class BaseAgent(ABC):
 
             self.active_tasks[task.id] = task
             task.assigned_to = self.id
-            task.status = TaskStatus.ASSIGNED
+            task.transition_to(TaskStatus.ASSIGNED)
             self.memory.store_episode(f"task:{task.id}", task)
             self._touch()
             logger.info("Task %s assigned to agent %s", task.id, self.name)
@@ -811,7 +894,7 @@ class BaseAgent(ABC):
         if task.dependencies and completed_task_ids is not None:
             unmet = [dep for dep in task.dependencies if dep not in completed_task_ids]
             if unmet:
-                task.status = TaskStatus.DEPENDENCY_BLOCKED
+                task.transition_to(TaskStatus.DEPENDENCY_BLOCKED)
                 task.error = f"Unmet dependencies: {unmet}"
                 logger.warning(
                     "Task %s blocked by unmet dependencies: %s",
@@ -827,6 +910,10 @@ class BaseAgent(ABC):
             if task.assigned_to != self.id:
                 raise ValueError(f"Task {task.id} is assigned to {task.assigned_to}, not {self.id}")
             start_time = datetime.now()
+            task.started_at = start_time
+            # Ensure task is in RUNNING state (idempotent if already RUNNING via system.execute_task)
+            if task.status != TaskStatus.RUNNING:
+                task.transition_to(TaskStatus.RUNNING)
             self.status = AgentStatus.BUSY
             self._touch()
             logger.info("Agent %s running task %s", self.name, task.id)
@@ -834,13 +921,14 @@ class BaseAgent(ABC):
         try:
             reasoning = self.think(task.parameters)
             result = self.act(reasoning)
-            task.status = TaskStatus.COMPLETED
+            task.transition_to(TaskStatus.COMPLETED)
             task.completed_at = datetime.now()
             self._record_task_outcome(task, success=True, start_time=start_time)
             logger.info("Task %s completed successfully", task.id)
             return result
-        except Exception:
-            task.status = TaskStatus.FAILED
+        except Exception as exc:
+            task.error = str(exc)
+            task.transition_to(TaskStatus.FAILED)
             self._record_task_outcome(task, success=False, start_time=start_time)
             logger.exception("Task %s failed", task.id)
             raise
@@ -854,7 +942,7 @@ class BaseAgent(ABC):
             if all(existing.id != task.id for existing in self.task_history):
                 self.task_history.append(task)
             self.active_tasks.pop(task.id, None)
-            self.status = AgentStatus.IDLE if success else AgentStatus.ERROR
+            self.status = AgentStatus.IDLE if not self.active_tasks else AgentStatus.BUSY
             self.memory.store_episode(f"task:{task.id}", task)
             self._touch()
 
@@ -869,13 +957,11 @@ class BaseAgent(ABC):
         start = datetime.now()
         try:
             result = self.run_task(task)
-            task.status = TaskStatus.COMPLETED
             elapsed_ms = (datetime.now() - start).total_seconds() * 1000
             if isinstance(task.metadata, dict):
                 task.metadata["duration_ms"] = elapsed_ms
             return result
         except Exception as exc:
-            task.status = TaskStatus.FAILED
             task.error = str(exc)
             raise
 
@@ -1202,6 +1288,7 @@ class AgentSystem:
         self.health_checker = HealthChecker()
         self.completed_tasks: List[Task] = []
         self.failed_tasks: List[Task] = []
+        self.task_history: List[Task] = []
         self.event_log: List[Dict[str, Any]] = []
         self.max_events = 10000
         self._idempotency_index: Dict[str, str] = {}
@@ -1219,6 +1306,7 @@ class AgentSystem:
             "avg_task_duration_success": 0.0,
             "avg_task_duration_failure": 0.0,
             "avg_task_duration_overall": 0.0,
+            "avg_task_duration": 0.0,
             "queue_stale_pops": 0,
             "dependency_blocked_tasks": 0,
             "claim_reclaims": 0,
@@ -1306,6 +1394,7 @@ class AgentSystem:
         target.assigned_to = source.assigned_to
         target.status = source.status
         target.created_at = source.created_at
+        target.started_at = source.started_at
         target.completed_at = source.completed_at
         target.result = copy.deepcopy(source.result)
         target.error = source.error
@@ -1362,6 +1451,7 @@ class AgentSystem:
             if not self.orchestrator.register_agent(agent):
                 self.agents.pop(agent.id, None)
                 return False
+            agent.system = self
             self.system_metrics["total_agents"] += 1
             logger.info("Agent %s added to system", agent.name)
             return True
@@ -1376,6 +1466,7 @@ class AgentSystem:
                 if agent.active_tasks:
                     logger.warning("Cannot remove agent %s while it has active tasks", agent.name)
                     return False
+                agent.system = None
                 self.agents.pop(agent_id)
                 self.orchestrator.managed_agents.pop(agent_id, None)
                 self.system_metrics["total_agents"] -= 1
@@ -1385,6 +1476,14 @@ class AgentSystem:
 
     def get_agent(self, agent_id: str) -> Optional[BaseAgent]:
         return self.agents.get(agent_id)
+
+    @property
+    def active_tasks(self) -> Dict[str, Task]:
+        """Return all tasks currently active (ASSIGNED/RUNNING) across all agents."""
+        result: Dict[str, Task] = {}
+        for agent in self.agents.values():
+            result.update(agent.active_tasks)
+        return result
 
     def create_task(
         self,
@@ -1411,6 +1510,14 @@ class AgentSystem:
                     self.system_metrics["idempotent_hits"] += 1
                     self._emit_event("task_create_deduplicated", existing, {"idempotency_key": idempotency_key})
                     return existing
+
+            # Validate that all declared dependencies exist in the system
+            unknown_deps = [
+                dep_id for dep_id in safe_dependencies
+                if self.task_store.get_task(dep_id) is None and dep_id not in self._task_index
+            ]
+            if unknown_deps:
+                raise ValueError(f"Unknown task dependencies: {unknown_deps}")
 
             task = Task(
                 description=description,
@@ -1522,6 +1629,7 @@ class AgentSystem:
                     completed_at=datetime.now(),
                 )
                 self._append_unique_task(self.completed_tasks, task)
+                self._append_unique_task(self.task_history, task)
                 self._update_system_metrics(success=True, start_time=start_time)
                 elapsed = (datetime.now() - start_time).total_seconds()
                 _METRICS.record_agent_task(success=True, duration_seconds=elapsed)
@@ -1539,6 +1647,7 @@ class AgentSystem:
                     completed_at=datetime.now(),
                 )
                 self._append_unique_task(self.failed_tasks, task)
+                self._append_unique_task(self.task_history, task)
                 self._update_system_metrics(success=False, start_time=start_time)
                 elapsed = (datetime.now() - start_time).total_seconds()
                 _METRICS.record_agent_task(success=False, duration_seconds=elapsed)
@@ -2055,6 +2164,7 @@ class AgentSystem:
         self.system_metrics["avg_task_duration_overall"] = overall_prev + (
             (elapsed - overall_prev) / total
         )
+        self.system_metrics["avg_task_duration"] = self.system_metrics["avg_task_duration_overall"]
         if success:
             n = self.system_metrics["successful_tasks"]
             prev = self.system_metrics["avg_task_duration_success"]
@@ -2235,12 +2345,13 @@ class AgentFactory:
     }
 
     @classmethod
-    def create_agent(cls, agent_type: str, name: str) -> Optional[BaseAgent]:
-        agent_class = cls._agent_templates.get(agent_type.lower())
-        if agent_class:
-            return agent_class(name)
-        logger.error("Unknown agent type: %s", agent_type)
-        return None
+    def create_agent(cls, agent_type: str, name: str) -> BaseAgent:
+        if not isinstance(agent_type, str) or not agent_type.strip():
+            raise ValueError("agent_type must be a non-empty string")
+        agent_class = cls._agent_templates.get(agent_type.strip().lower())
+        if agent_class is None:
+            raise ValueError(f"Unknown agent_type: {agent_type!r}")
+        return agent_class(name)
 
     @classmethod
     def create_team(
@@ -2251,9 +2362,11 @@ class AgentFactory:
             if count < 0:
                 raise ValueError(f"Agent count cannot be negative for type: {agent_type}")
             for i in range(count):
-                agent = cls.create_agent(agent_type, f"{agent_type.title()}-{i + 1}")
-                if agent:
+                try:
+                    agent = cls.create_agent(agent_type, f"{agent_type.title()}-{i + 1}")
                     system.add_agent(agent)
+                except ValueError:
+                    logger.warning("Skipping unknown agent type in create_team: %s", agent_type)
         logger.info("Agent team created with config: %s", team_config)
         return system
 

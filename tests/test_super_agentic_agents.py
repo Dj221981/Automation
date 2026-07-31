@@ -518,5 +518,299 @@ def test_queue_dedup_and_cancel_task():
     assert task.id not in system._task_index
 
 
+# ============================================================================
+# PR #2 Hardening tests (adapted to main's execute_task architecture)
+# ============================================================================
+
+class FailingActExecutorAgent(ExecutorAgent):
+    """ExecutorAgent whose act() always raises to simulate failures."""
+
+    def act(self, decision: Dict[str, Any]) -> Any:
+        raise RuntimeError("simulated failure")
+
+
+def test_task_lifecycle_methods():
+    """Task.is_terminal, transition_to, duration_seconds, and started_at work correctly."""
+    task = make_task("Lifecycle check")
+    assert not task.is_terminal()
+    assert task.started_at is None
+    assert task.status_value == "pending"
+    assert task.duration_seconds() is None
+
+    task.transition_to(TaskStatus.ASSIGNED)
+    assert task.status == TaskStatus.ASSIGNED
+    assert not task.is_terminal()
+
+    task.transition_to(TaskStatus.RUNNING)
+    assert task.status == TaskStatus.RUNNING
+
+    from datetime import datetime
+    task.started_at = datetime.now()
+    task.transition_to(TaskStatus.COMPLETED)
+    task.completed_at = datetime.now()
+    assert task.is_terminal()
+    assert task.duration_seconds() is not None
+    assert task.duration_seconds() >= 0.0
+
+    # Status history recorded
+    history = task.metadata.get("status_history", [])
+    assert len(history) >= 2
+    assert history[-1]["to"] == TaskStatus.COMPLETED.value
+
+
+def test_task_invalid_transition_raises():
+    """transition_to raises ValueError for illegal transitions."""
+    task = make_task("Invalid transition")
+    task.transition_to(TaskStatus.ASSIGNED)
+    task.transition_to(TaskStatus.RUNNING)
+    task.transition_to(TaskStatus.COMPLETED)
+
+    with pytest.raises(ValueError, match="Illegal task transition"):
+        task.transition_to(TaskStatus.RUNNING)
+
+
+def test_task_type_validation():
+    """Task.__post_init__ raises TypeError for wrong parameter/metadata/dependency types."""
+    with pytest.raises(TypeError, match="dictionary"):
+        Task(description="Bad params", parameters=[])  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="dictionary"):
+        Task(description="Bad meta", metadata="not-a-dict")  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="list"):
+        Task(description="Bad deps", dependencies="not-a-list")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        Task(description="  ")
+
+
+def test_task_description_stripped():
+    """Task descriptions are stripped of surrounding whitespace."""
+    task = Task(description="  trimmed  ", parameters={})
+    assert task.description == "trimmed"
+
+
+def test_task_success_updates_bookkeeping():
+    """Successful execution via system.execute_task updates all lifecycle tracking."""
+    store = InMemoryTaskStore()
+    system = AgentSystem("LifecycleSystem", task_store=store)
+    executor = ExecutorAgent("LifecycleExecutor")
+    assert system.add_agent(executor)
+
+    task = system.create_task(
+        description="Process lifecycle metrics",
+        parameters={"metric": "latency"},
+        priority=TaskPriority.HIGH,
+    )
+
+    # Task is in the queue and _task_index before submission
+    assert task.id in system._task_index
+
+    assert system.submit_task(task, executor.id) is True
+    assert task.status == TaskStatus.ASSIGNED
+    assert task.id in executor.active_tasks
+    # active_tasks property aggregates from agents
+    assert task.id in system.active_tasks
+    # Dequeued after assignment
+    assert task.id not in system._task_index
+
+    result = system.execute_task(task.id, executor.id)
+
+    assert result["execution"] == "successful"
+    assert task.status == TaskStatus.COMPLETED
+    assert task.completed_at is not None
+    assert task.started_at is not None
+    assert executor.status == AgentStatus.IDLE
+    assert task.id not in executor.active_tasks
+    assert task.id not in system.active_tasks
+    assert task in executor.completed_tasks
+    assert task in executor.task_history
+    assert task in system.completed_tasks
+    assert task in system.task_history
+    assert task not in system.failed_tasks
+    assert executor.performance_metrics["tasks_completed"] == 1
+    assert executor.performance_metrics["tasks_failed"] == 0
+    assert system.system_metrics["successful_tasks"] == 1
+    assert system.system_metrics["failed_tasks"] == 0
+    assert system.system_metrics["avg_task_duration"] >= 0
+
+    # Status history in metadata
+    history = task.metadata.get("status_history", [])
+    assert any(entry["to"] == TaskStatus.COMPLETED.value for entry in history)
+
+
+def test_task_failure_updates_metrics(monkeypatch):
+    """Execution failures update metrics and do not leave stale active-task state."""
+    store = InMemoryTaskStore()
+    system = AgentSystem("FailureSystem", task_store=store)
+    executor = ExecutorAgent("FailureExecutor")
+    assert system.add_agent(executor)
+
+    task = system.create_task(
+        description="Fail gracefully",
+        parameters={"should_fail": True},
+    )
+    assert system.submit_task(task, executor.id) is True
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        monkeypatch.setattr(executor, "act", lambda _d: (_ for _ in ()).throw(RuntimeError("simulated failure")))
+        system.execute_task(task.id, executor.id)
+
+    assert task.status == TaskStatus.FAILED
+    assert executor.status == AgentStatus.IDLE
+    assert task.id not in executor.active_tasks
+    assert task.id not in system.active_tasks
+    assert task not in system.completed_tasks
+    assert task in system.failed_tasks
+    assert task in system.task_history
+    assert system.system_metrics["failed_tasks"] == 1
+    assert system.system_metrics["successful_tasks"] == 0
+
+    history = task.metadata.get("status_history", [])
+    assert any(entry["to"] == TaskStatus.FAILED.value for entry in history)
+
+
+def test_dependency_validation_at_creation_time():
+    """create_task raises ValueError when dependency IDs are unknown to the system."""
+    store = InMemoryTaskStore()
+    system = AgentSystem("DependencySystem", task_store=store)
+
+    with pytest.raises(ValueError, match="Unknown task dependencies"):
+        system.create_task(
+            description="Broken dependency task",
+            parameters={},
+            dependencies=["missing-task-id"],
+        )
+
+
+def test_known_dependency_accepted_at_creation():
+    """create_task accepts dependency IDs that correspond to existing tasks."""
+    store = InMemoryTaskStore()
+    system = AgentSystem("DependencySystem", task_store=store)
+
+    prerequisite = system.create_task(description="Prerequisite", parameters={})
+    dependent = system.create_task(
+        description="Dependent task",
+        parameters={},
+        dependencies=[prerequisite.id],
+    )
+    assert prerequisite.id in dependent.dependencies
+
+
+def test_queue_ordering_high_before_low():
+    """High-priority tasks appear before low-priority tasks in the queue heap."""
+    store = InMemoryTaskStore()
+    system = AgentSystem("OrderSystem", task_store=store)
+
+    low = system.create_task("Low priority", parameters={}, priority=TaskPriority.LOW)
+    high = system.create_task("High priority", parameters={}, priority=TaskPriority.HIGH)
+
+    # heapq root is always the minimum element (highest priority = lowest priority_rank value)
+    assert system.global_task_queue[0].id == high.id
+
+
+def test_submit_task_blocked_by_unmet_dependency():
+    """submit_task returns False when a task's dependency has not completed."""
+    store = InMemoryTaskStore()
+    system = AgentSystem("DepBlockSystem", task_store=store)
+    executor = ExecutorAgent("Executor-dep")
+    system.add_agent(executor)
+
+    prerequisite = system.create_task("Prerequisite", parameters={})
+    dependent = system.create_task(
+        "Dependent", parameters={}, dependencies=[prerequisite.id]
+    )
+
+    # Cannot submit dependent while prerequisite is still pending
+    assert system.submit_task(dependent, executor.id) is False
+    assert dependent.status == TaskStatus.PENDING
+    assert dependent.id in system._task_index
+
+    # After completing prerequisite, dependent can be submitted
+    assert system.submit_task(prerequisite, executor.id) is True
+    system.execute_task(prerequisite.id, executor.id)
+    assert system.submit_task(dependent, executor.id) is True
+
+
+def test_agent_system_attribute_set_on_add_cleared_on_remove():
+    """agent.system is set when added to a system and cleared when removed."""
+    store = InMemoryTaskStore()
+    system = AgentSystem("SystemAttrSystem", task_store=store)
+    executor = ExecutorAgent("Executor-sys")
+    assert executor.system is None
+
+    assert system.add_agent(executor) is True
+    assert executor.system is system
+
+    assert system.remove_agent(executor.id) is True
+    assert executor.system is None
+    assert executor.id not in system.agents
+    assert executor.id not in system.orchestrator.managed_agents
+
+
+def test_remove_agent_rejects_while_task_active():
+    """remove_agent returns False while the agent has an active assigned task."""
+    store = InMemoryTaskStore()
+    system = AgentSystem("RemovalSystem", task_store=store)
+    executor = ExecutorAgent("Executor-busy")
+    system.add_agent(executor)
+
+    task = system.create_task("Work before removal", parameters={})
+    assert system.submit_task(task, executor.id) is True
+
+    # Cannot remove while task is active
+    assert system.remove_agent(executor.id) is False
+
+    # After completing the task via system, removal succeeds
+    system.execute_task(task.id, executor.id)
+    assert system.remove_agent(executor.id) is True
+
+
+def test_invalid_agent_name_raises():
+    """BaseAgent raises ValueError for empty or whitespace-only names."""
+    with pytest.raises(ValueError, match="empty or whitespace-only"):
+        ExecutorAgent(" ")
+
+    with pytest.raises(ValueError, match="empty or whitespace-only"):
+        ExecutorAgent("")
+
+
+def test_agent_name_stripped():
+    """BaseAgent.name is stripped of surrounding whitespace."""
+    agent = ExecutorAgent("  MyAgent  ")
+    assert agent.name == "MyAgent"
+
+
+def test_agent_factory_raises_for_unknown_type():
+    """AgentFactory.create_agent raises ValueError for unknown or empty agent_type."""
+    with pytest.raises(ValueError, match="agent_type"):
+        AgentFactory.create_agent("", "NamedAgent")
+
+    with pytest.raises(ValueError, match="agent_type"):
+        AgentFactory.create_agent("unknown_type", "NamedAgent")
+
+
+def test_task_cancelled_is_terminal():
+    """CANCELLED is treated as a terminal state by is_terminal()."""
+    task = make_task("Cancel me")
+    task.transition_to(TaskStatus.ASSIGNED)
+    task.transition_to(TaskStatus.CANCELLED)
+    assert task.is_terminal()
+
+    with pytest.raises(ValueError, match="Illegal task transition"):
+        task.transition_to(TaskStatus.PENDING)
+
+
+def test_task_dependency_blocked_recovers_to_pending():
+    """DEPENDENCY_BLOCKED task can transition back to PENDING."""
+    task = make_task("Blocked task")
+    task.transition_to(TaskStatus.DEPENDENCY_BLOCKED)
+    assert task.status == TaskStatus.DEPENDENCY_BLOCKED
+    assert not task.is_terminal()
+
+    task.transition_to(TaskStatus.PENDING)
+    assert task.status == TaskStatus.PENDING
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
