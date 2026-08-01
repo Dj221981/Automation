@@ -40,16 +40,14 @@ class TestNormalizationStats(unittest.TestCase):
             std=np.array([0.3, 0.5]),
             median=np.array([0.5, 0.0]),
             q25=np.array([0.25, -0.5]),
-            q75=np.array([0.75, 0.5])
+            q75=np.array([0.75, 0.5]),
         )
-        
+
         dict_data = stats.to_dict()
         recovered_stats = NormalizationStats.from_dict(dict_data)
-        
+
         for key in ["min_val", "max_val", "mean", "std", "median", "q25", "q75"]:
-            np.testing.assert_array_almost_equal(
-                getattr(stats, key), getattr(recovered_stats, key)
-            )
+            np.testing.assert_array_almost_equal(getattr(stats, key), getattr(recovered_stats, key))
 
     def test_from_dict_missing_keys(self):
         """Test error handling for missing keys."""
@@ -81,21 +79,21 @@ class TestStateNormalizer(unittest.TestCase):
     def test_fit_validation(self):
         """Test fit() input validation."""
         normalizer = StateNormalizer()
-        
+
         # Empty data
         with self.assertRaises(ValueError):
             normalizer.fit(np.array([]))
-        
+
         # 1D data
         with self.assertRaises(ValueError):
             normalizer.fit(np.array([1, 2, 3]))
-        
+
         # Data with NaN
         bad_data = self.data.copy()
         bad_data[0, 0] = np.nan
         with self.assertRaises(ValueError):
             normalizer.fit(bad_data)
-        
+
         # Data with inf
         bad_data = self.data.copy()
         bad_data[0, 0] = np.inf
@@ -113,7 +111,7 @@ class TestStateNormalizer(unittest.TestCase):
         """Test MINMAX normalization."""
         normalizer = StateNormalizer(normalization_type=NormalizationType.MINMAX)
         normalizer.fit(self.data)
-        
+
         normalized = normalizer.normalize(self.data)
         # Check that values are roughly in [0, 1] range (with some tolerance)
         self.assertTrue(np.all(normalized >= -0.1))
@@ -123,7 +121,7 @@ class TestStateNormalizer(unittest.TestCase):
         """Test Z-score normalization."""
         normalizer = StateNormalizer(normalization_type=NormalizationType.ZSCORE)
         normalizer.fit(self.data)
-        
+
         normalized = normalizer.normalize(self.data)
         # Check that mean is near 0 and std is near 1
         self.assertAlmostEqual(np.mean(normalized), 0, places=1)
@@ -133,7 +131,7 @@ class TestStateNormalizer(unittest.TestCase):
         """Test robust normalization."""
         normalizer = StateNormalizer(normalization_type=NormalizationType.ROBUST)
         normalizer.fit(self.data)
-        
+
         normalized = normalizer.normalize(self.data)
         self.assertTrue(np.all(np.isfinite(normalized)))
 
@@ -141,19 +139,23 @@ class TestStateNormalizer(unittest.TestCase):
         """Test NONE normalization (identity)."""
         normalizer = StateNormalizer(normalization_type=NormalizationType.NONE)
         normalizer.fit(self.data)
-        
+
         normalized = normalizer.normalize(self.data)
         np.testing.assert_array_almost_equal(normalized, self.data)
 
     def test_denormalize(self):
         """Test denormalization."""
-        for norm_type in [NormalizationType.MINMAX, NormalizationType.ZSCORE, NormalizationType.ROBUST]:
+        for norm_type in [
+            NormalizationType.MINMAX,
+            NormalizationType.ZSCORE,
+            NormalizationType.ROBUST,
+        ]:
             normalizer = StateNormalizer(normalization_type=norm_type)
             normalizer.fit(self.data)
-            
+
             normalized = normalizer.normalize(self.data)
             denormalized = normalizer.denormalize(normalized)
-            
+
             np.testing.assert_array_almost_equal(denormalized, self.data, decimal=5)
 
     def test_normalize_without_fit(self):
@@ -166,7 +168,7 @@ class TestStateNormalizer(unittest.TestCase):
         """Test error on shape mismatch."""
         normalizer = StateNormalizer()
         normalizer.fit(self.data)
-        
+
         wrong_shape_data = np.random.randn(5, 20).astype(np.float32)
         with self.assertRaises(ValueError):
             normalizer.normalize(wrong_shape_data)
@@ -175,7 +177,7 @@ class TestStateNormalizer(unittest.TestCase):
         """Test error on NaN in input."""
         normalizer = StateNormalizer()
         normalizer.fit(self.data)
-        
+
         bad_data = self.data.copy()
         bad_data[0, 0] = np.nan
         with self.assertRaises(ValueError):
@@ -185,16 +187,16 @@ class TestStateNormalizer(unittest.TestCase):
         """Test save and load operations."""
         normalizer = StateNormalizer(normalization_type=NormalizationType.MINMAX)
         normalizer.fit(self.data)
-        
+
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "normalizer.json")
             normalizer.save(filepath)
             self.assertTrue(os.path.exists(filepath))
-            
+
             # Load into new normalizer
             normalizer2 = StateNormalizer()
             normalizer2.load(filepath)
-            
+
             # Test that loaded normalizer works the same
             norm1 = normalizer.normalize(self.data[:10])
             norm2 = normalizer2.normalize(self.data[:10])
@@ -246,9 +248,9 @@ class TestDataAugmentation(unittest.TestCase):
         x2 = np.random.randn(10, 5).astype(np.float32)
         y1 = np.random.randn(10, 2).astype(np.float32)
         y2 = np.random.randn(10, 2).astype(np.float32)
-        
+
         x_mixed, y_mixed = DataAugmentation.mixup(x1, x2, y1, y2, alpha=0.2, seed=42)
-        
+
         self.assertEqual(x_mixed.shape, x1.shape)
         self.assertEqual(y_mixed.shape, y1.shape)
         self.assertTrue(np.all(np.isfinite(x_mixed)))
@@ -260,7 +262,7 @@ class TestDataAugmentation(unittest.TestCase):
         x2 = np.random.randn(10, 6).astype(np.float32)
         y1 = np.random.randn(10, 2).astype(np.float32)
         y2 = np.random.randn(10, 2).astype(np.float32)
-        
+
         with self.assertRaises(ValueError):
             DataAugmentation.mixup(x1, x2, y1, y2)
 
@@ -270,7 +272,7 @@ class TestDataAugmentation(unittest.TestCase):
         x2 = np.random.randn(10, 5).astype(np.float32)
         y1 = np.random.randn(10, 2).astype(np.float32)
         y2 = np.random.randn(10, 2).astype(np.float32)
-        
+
         with self.assertRaises(ValueError):
             DataAugmentation.mixup(x1, x2, y1, y2, alpha=0)
 
@@ -334,10 +336,16 @@ class TestExperiencePreprocessor(unittest.TestCase):
         rewards = np.random.randn(10).astype(np.float32)
         next_states = self.data[:10]
         dones = np.zeros(10, dtype=np.float32)
-        
+
         result = preprocessor.process_batch(states, actions, rewards, next_states, dones)
-        processed_states, processed_actions, processed_rewards, processed_next_states, processed_dones = result
-        
+        (
+            processed_states,
+            processed_actions,
+            processed_rewards,
+            processed_next_states,
+            processed_dones,
+        ) = result
+
         self.assertEqual(processed_states.shape, states.shape)
         self.assertTrue(np.all(np.isfinite(processed_states)))
 
@@ -349,7 +357,7 @@ class TestExperiencePreprocessor(unittest.TestCase):
         rewards = np.random.randn(10).astype(np.float32)
         next_states = np.random.randn(10, 5).astype(np.float32)
         dones = np.zeros(10, dtype=np.float32)
-        
+
         with self.assertRaises(ValueError):
             preprocessor.process_batch(states, actions, rewards, next_states, dones)
 
@@ -368,25 +376,29 @@ class TestBatchGenerator(unittest.TestCase):
     def test_initialization(self):
         """Test batch generator initialization."""
         gen = BatchGenerator(
-            self.states, self.actions, self.rewards, self.next_states, self.dones,
-            batch_size=32
+            self.states, self.actions, self.rewards, self.next_states, self.dones, batch_size=32
         )
         self.assertEqual(len(gen), int(np.ceil(100 / 32)))
 
     def test_iteration(self):
         """Test batch generation."""
         gen = BatchGenerator(
-            self.states, self.actions, self.rewards, self.next_states, self.dones,
-            batch_size=32, shuffle=False
+            self.states,
+            self.actions,
+            self.rewards,
+            self.next_states,
+            self.dones,
+            batch_size=32,
+            shuffle=False,
         )
-        
+
         batch_count = 0
         total_samples = 0
         for states, actions, rewards, next_states, dones in gen:
             batch_count += 1
             total_samples += len(states)
             self.assertTrue(np.all(np.isfinite(states)))
-        
+
         self.assertEqual(total_samples, 100)
         self.assertEqual(batch_count, len(gen))
 
@@ -394,8 +406,7 @@ class TestBatchGenerator(unittest.TestCase):
         """Test error on invalid batch_size."""
         with self.assertRaises(ValueError):
             BatchGenerator(
-                self.states, self.actions, self.rewards, self.next_states, self.dones,
-                batch_size=0
+                self.states, self.actions, self.rewards, self.next_states, self.dones, batch_size=0
             )
 
     def test_empty_data(self):
@@ -405,7 +416,7 @@ class TestBatchGenerator(unittest.TestCase):
         empty_rewards = np.array([], dtype=np.float32)
         empty_next_states = np.array([], dtype=np.float32).reshape(0, 10)
         empty_dones = np.array([], dtype=np.float32)
-        
+
         with self.assertRaises(ValueError):
             BatchGenerator(
                 empty_states, empty_actions, empty_rewards, empty_next_states, empty_dones
@@ -422,7 +433,7 @@ class TestSplitData(unittest.TestCase):
     def test_split_valid(self):
         """Test valid data split."""
         train, val, test = split_data(self.data, train_ratio=0.8, val_ratio=0.1, random_seed=42)
-        
+
         total = len(train) + len(val) + len(test)
         self.assertEqual(total, 1000)
         self.assertEqual(len(train), 800)
@@ -432,7 +443,7 @@ class TestSplitData(unittest.TestCase):
     def test_split_no_test_set(self):
         """Test split with no test set."""
         train, val, test = split_data(self.data, train_ratio=0.9, val_ratio=0.1)
-        
+
         total = len(train) + len(val) + len(test)
         self.assertEqual(total, 1000)
         self.assertEqual(len(test), 0)
@@ -441,10 +452,10 @@ class TestSplitData(unittest.TestCase):
         """Test error on invalid ratios."""
         with self.assertRaises(ValueError):
             split_data(self.data, train_ratio=0)  # Must be > 0
-        
+
         with self.assertRaises(ValueError):
             split_data(self.data, train_ratio=1.0)  # Must be < 1
-        
+
         with self.assertRaises(ValueError):
             split_data(self.data, train_ratio=0.6, val_ratio=0.5)  # Sum must be < 1
 
@@ -465,7 +476,7 @@ class TestSlidingWindow(unittest.TestCase):
     def test_sliding_window_valid(self):
         """Test valid sliding window creation."""
         windows = create_sliding_window(self.data, window_size=10, step=5)
-        
+
         expected_num = (100 - 10) // 5 + 1
         self.assertEqual(windows.shape[0], expected_num)
         self.assertEqual(windows.shape[1], 10)
@@ -474,7 +485,7 @@ class TestSlidingWindow(unittest.TestCase):
     def test_sliding_window_step_1(self):
         """Test sliding window with step 1."""
         windows = create_sliding_window(self.data, window_size=10, step=1)
-        
+
         expected_num = 100 - 10 + 1
         self.assertEqual(windows.shape[0], expected_num)
 
@@ -482,7 +493,7 @@ class TestSlidingWindow(unittest.TestCase):
         """Test error on invalid window_size."""
         with self.assertRaises(ValueError):
             create_sliding_window(self.data, window_size=0)
-        
+
         with self.assertRaises(ValueError):
             create_sliding_window(self.data, window_size=150)  # Larger than data
 
@@ -490,7 +501,7 @@ class TestSlidingWindow(unittest.TestCase):
         """Test error on invalid step."""
         with self.assertRaises(ValueError):
             create_sliding_window(self.data, window_size=10, step=0)
-        
+
         with self.assertRaises(ValueError):
             create_sliding_window(self.data, window_size=10, step=-1)
 
