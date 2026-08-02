@@ -1,0 +1,45 @@
+# Machine learning & scientific computing
+numpy>=1.26.0,<2.0.0
+tensorflow>=2.16.0,<3.0.0
+torch>=2.6.0,<3.0.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+
+# Agent framework core
+openai>=1.0.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
+
+# Web framework
+fastapi>=0.110.0
+uvicorn>=0.29.0
+
+# Storage & caching
+redis>=5.0.0,<6.0.0
+psycopg[binary]>=3.1.0,<4.0.0
+
+# Security
+cryptography>=42.0.0,<44.0.0
+
+# Observability
+prometheus-client>=0.20.0,<1.0.0
+opentelemetry-api>=1.25.0,<2.0.0
+opentelemetry-sdk>=1.25.0,<2.0.0
+opentelemetry-exporter-jaeger-thrift>=1.21.0,<2.0.0
+opentelemetry-exporter-zipkin-json>=1.21.0,<2.0.0
+python-json-logger>=2.0.7,<4.0.0
+psutil>=5.9.0,<7.0.0
+
+# Testing
+pytest>=8.0.0,<9.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+
+# Code quality
+black>=23.0.0
+flake8>=6.0.0
+isort>=5.12.0
+mypy>=1.5.0
+bandit>=1.7.5
+safety>=2.3.0

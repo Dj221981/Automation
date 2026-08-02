@@ -1,0 +1,24 @@
+tracing:
+  enabled: true
+  service_name: automation
+  exporter: jaeger
+  endpoint: http://localhost:14268/api/traces
+  sampling_rate: 0.2
+
+logging:
+  level: INFO
+  format: json
+  include_trace_context: true
+
+metrics:
+  enabled: true
+  export_port: 9464
+  collection_interval_seconds: 15
+
+alerts:
+  task_failure_rate_threshold: 0.2
+  training_loss_zscore_threshold: 3.0
+  queue_depth_warning: 1000
+  memory_usage_bytes_threshold: 2000000000
+  cpu_usage_percent_threshold: 90
+  response_time_slo_seconds: 2.0

@@ -18,14 +18,9 @@ dqn_config = {
         "epsilon_min": 0.01,
         "device": "cpu",
         "hidden_layers": [128, 64],
-        "activation": "relu"
+        "activation": "relu",
     },
-    "environment": {
-        "state_size": 64,
-        "action_size": 10,
-        "max_steps": 500,
-        "reward_scale": 1.0
-    },
+    "environment": {"state_size": 64, "action_size": 10, "max_steps": 500, "reward_scale": 1.0},
     "training": {
         "model_type": "dqn",
         "episodes": 200,
@@ -37,23 +32,19 @@ dqn_config = {
         "verbose": 10,
         "eval_episodes": 10,
         "checkpoint_dir": "checkpoints/dqn",
-        "early_stopping_patience": 20
+        "early_stopping_patience": 20,
     },
     "data": {
         "normalization_type": "minmax",
         "reward_normalization": true,
-        "augmentation": {
-            "enabled": true,
-            "noise_std": 0.05,
-            "mixup_alpha": 0.2
-        }
+        "augmentation": {"enabled": true, "noise_std": 0.05, "mixup_alpha": 0.2},
     },
     "evaluation": {
         "eval_frequency": 10,
         "eval_episodes": 10,
         "save_best_model": true,
-        "save_all_checkpoints": false
-    }
+        "save_all_checkpoints": false,
+    },
 }
 
 # Policy Gradient Configuration
@@ -69,14 +60,9 @@ policy_config = {
         "hidden_layers": [128, 64],
         "activation": "relu",
         "action_space": "discrete",
-        "entropy_coeff": 0.01
+        "entropy_coeff": 0.01,
     },
-    "environment": {
-        "state_size": 64,
-        "action_size": 10,
-        "max_steps": 500,
-        "reward_scale": 1.0
-    },
+    "environment": {"state_size": 64, "action_size": 10, "max_steps": 500, "reward_scale": 1.0},
     "training": {
         "model_type": "policy_gradient",
         "episodes": 150,
@@ -88,23 +74,19 @@ policy_config = {
         "verbose": 5,
         "eval_episodes": 10,
         "checkpoint_dir": "checkpoints/policy",
-        "early_stopping_patience": 15
+        "early_stopping_patience": 15,
     },
     "data": {
         "normalization_type": "zscore",
         "reward_normalization": true,
-        "augmentation": {
-            "enabled": true,
-            "noise_std": 0.05,
-            "mixup_alpha": 0.15
-        }
+        "augmentation": {"enabled": true, "noise_std": 0.05, "mixup_alpha": 0.15},
     },
     "evaluation": {
         "eval_frequency": 10,
         "eval_episodes": 10,
         "save_best_model": true,
-        "save_all_checkpoints": false
-    }
+        "save_all_checkpoints": false,
+    },
 }
 
 # Small Model Configuration (for testing/quick training)
@@ -120,14 +102,9 @@ small_config = {
         "epsilon_min": 0.01,
         "device": "cpu",
         "hidden_layers": [64, 32],
-        "activation": "relu"
+        "activation": "relu",
     },
-    "environment": {
-        "state_size": 32,
-        "action_size": 5,
-        "max_steps": 200,
-        "reward_scale": 1.0
-    },
+    "environment": {"state_size": 32, "action_size": 5, "max_steps": 200, "reward_scale": 1.0},
     "training": {
         "model_type": "dqn",
         "episodes": 50,
@@ -139,23 +116,19 @@ small_config = {
         "verbose": 5,
         "eval_episodes": 5,
         "checkpoint_dir": "checkpoints/small",
-        "early_stopping_patience": 10
+        "early_stopping_patience": 10,
     },
     "data": {
         "normalization_type": "minmax",
         "reward_normalization": false,
-        "augmentation": {
-            "enabled": false,
-            "noise_std": 0.0,
-            "mixup_alpha": 0.0
-        }
+        "augmentation": {"enabled": false, "noise_std": 0.0, "mixup_alpha": 0.0},
     },
     "evaluation": {
         "eval_frequency": 5,
         "eval_episodes": 5,
         "save_best_model": true,
-        "save_all_checkpoints": false
-    }
+        "save_all_checkpoints": false,
+    },
 }
 
 # Large Model Configuration (for production)
@@ -171,14 +144,9 @@ large_config = {
         "epsilon_min": 0.001,
         "device": "gpu",
         "hidden_layers": [512, 256, 128],
-        "activation": "relu"
+        "activation": "relu",
     },
-    "environment": {
-        "state_size": 256,
-        "action_size": 50,
-        "max_steps": 1000,
-        "reward_scale": 1.0
-    },
+    "environment": {"state_size": 256, "action_size": 50, "max_steps": 1000, "reward_scale": 1.0},
     "training": {
         "model_type": "dqn",
         "episodes": 500,
@@ -190,23 +158,19 @@ large_config = {
         "verbose": 20,
         "eval_episodes": 20,
         "checkpoint_dir": "checkpoints/large",
-        "early_stopping_patience": 50
+        "early_stopping_patience": 50,
     },
     "data": {
         "normalization_type": "robust",
         "reward_normalization": true,
-        "augmentation": {
-            "enabled": true,
-            "noise_std": 0.02,
-            "mixup_alpha": 0.3
-        }
+        "augmentation": {"enabled": true, "noise_std": 0.02, "mixup_alpha": 0.3},
     },
     "evaluation": {
         "eval_frequency": 50,
         "eval_episodes": 20,
         "save_best_model": true,
-        "save_all_checkpoints": false
-    }
+        "save_all_checkpoints": false,
+    },
 }
 
 # Continuous Control Configuration
@@ -223,14 +187,9 @@ continuous_config = {
         "activation": "relu",
         "action_space": "continuous",
         "entropy_coeff": 0.001,
-        "action_scale": 1.0
+        "action_scale": 1.0,
     },
-    "environment": {
-        "state_size": 64,
-        "action_size": 6,
-        "max_steps": 500,
-        "reward_scale": 1.0
-    },
+    "environment": {"state_size": 64, "action_size": 6, "max_steps": 500, "reward_scale": 1.0},
     "training": {
         "model_type": "policy_gradient",
         "episodes": 200,
@@ -242,23 +201,19 @@ continuous_config = {
         "verbose": 10,
         "eval_episodes": 10,
         "checkpoint_dir": "checkpoints/continuous",
-        "early_stopping_patience": 30
+        "early_stopping_patience": 30,
     },
     "data": {
         "normalization_type": "zscore",
         "reward_normalization": true,
-        "augmentation": {
-            "enabled": true,
-            "noise_std": 0.05,
-            "mixup_alpha": 0.2
-        }
+        "augmentation": {"enabled": true, "noise_std": 0.05, "mixup_alpha": 0.2},
     },
     "evaluation": {
         "eval_frequency": 20,
         "eval_episodes": 10,
         "save_best_model": true,
-        "save_all_checkpoints": false
-    }
+        "save_all_checkpoints": false,
+    },
 }
 
 # Multi-Agent Configuration
@@ -274,14 +229,14 @@ multi_agent_config = {
         "epsilon_min": 0.01,
         "device": "gpu",
         "hidden_layers": [256, 128, 64],
-        "activation": "relu"
+        "activation": "relu",
     },
     "environment": {
         "state_size": 128,
         "action_size": 20,
         "max_steps": 800,
         "reward_scale": 1.0,
-        "num_agents": 4
+        "num_agents": 4,
     },
     "training": {
         "model_type": "dqn",
@@ -294,23 +249,19 @@ multi_agent_config = {
         "verbose": 15,
         "eval_episodes": 15,
         "checkpoint_dir": "checkpoints/multi_agent",
-        "early_stopping_patience": 40
+        "early_stopping_patience": 40,
     },
     "data": {
         "normalization_type": "minmax",
         "reward_normalization": true,
-        "augmentation": {
-            "enabled": true,
-            "noise_std": 0.05,
-            "mixup_alpha": 0.2
-        }
+        "augmentation": {"enabled": true, "noise_std": 0.05, "mixup_alpha": 0.2},
     },
     "evaluation": {
         "eval_frequency": 30,
         "eval_episodes": 15,
         "save_best_model": true,
-        "save_all_checkpoints": false
-    }
+        "save_all_checkpoints": false,
+    },
 }
 
 
@@ -320,7 +271,7 @@ CONFIG_REGISTRY = {
     "small": small_config,
     "large": large_config,
     "continuous": continuous_config,
-    "multi_agent": multi_agent_config
+    "multi_agent": multi_agent_config,
 }
 
 
@@ -339,10 +290,9 @@ def get_config(config_name: str = "dqn") -> dict:
     """
     if config_name not in CONFIG_REGISTRY:
         raise ValueError(
-            f"Unknown configuration: {config_name}. "
-            f"Available: {list(CONFIG_REGISTRY.keys())}"
+            f"Unknown configuration: {config_name}. " f"Available: {list(CONFIG_REGISTRY.keys())}"
         )
-    
+
     return CONFIG_REGISTRY[config_name].copy()
 
 
@@ -353,10 +303,10 @@ def list_configs() -> list:
 
 if __name__ == "__main__":
     import json
-    
+
     print("Available configurations:")
     for config_name in list_configs():
         print(f"  - {config_name}")
-    
+
     print("\nExample DQN config:")
     print(json.dumps(get_config("dqn"), indent=2))
