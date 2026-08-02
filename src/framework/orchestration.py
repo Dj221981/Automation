@@ -57,7 +57,7 @@ from __future__ import annotations
 import time
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 __all__ = [
     "PipelineStepResult",
@@ -69,6 +69,32 @@ __all__ = [
     "CoordinatorResult",
     "Coordinator",
 ]
+
+
+def _normalize_name(value: str, field_name: str) -> str:
+    """Return a normalized non-empty string value for a public name field."""
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a non-empty string")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} cannot be empty")
+    return normalized
+
+
+def _coerce_context(
+    context: Optional[Mapping[str, Any]],
+    field_name: str,
+) -> Dict[str, Any]:
+    """Copy a context mapping into a plain dict.
+
+    ``None`` is treated as an empty context. Non-mapping inputs raise a clear
+    :class:`TypeError` instead of leaking lower-level conversion errors.
+    """
+    if context is None:
+        return {}
+    if not isinstance(context, Mapping):
+        raise TypeError(f"{field_name} must be a mapping or None")
+    return dict(context)
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +139,7 @@ class PipelineStep:
     stop_on_error: bool = True
 
     def __post_init__(self) -> None:
-        if not self.name.strip():
-            raise ValueError("PipelineStep name cannot be empty")
+        self.name = _normalize_name(self.name, "PipelineStep name")
         if not callable(self.handler):
             raise TypeError("PipelineStep handler must be callable")
 
@@ -149,9 +174,7 @@ class Pipeline:
     """
 
     def __init__(self, name: str) -> None:
-        if not name.strip():
-            raise ValueError("Pipeline name cannot be empty")
-        self.name = name.strip()
+        self.name = _normalize_name(name, "Pipeline name")
         self._steps: List[PipelineStep] = []
         self._lock = threading.RLock()
 
@@ -165,9 +188,10 @@ class Pipeline:
 
     def remove_step(self, name: str) -> bool:
         """Remove the first step with the given name.  Returns whether it was found."""
+        normalized_name = _normalize_name(name, "step name")
         with self._lock:
             for i, s in enumerate(self._steps):
-                if s.name == name:
+                if s.name == normalized_name:
                     self._steps.pop(i)
                     return True
         return False
@@ -177,9 +201,13 @@ class Pipeline:
         with self._lock:
             return list(self._steps)
 
-    def run(self, initial_context: Optional[Dict[str, Any]] = None) -> PipelineResult:
-        """Execute all steps sequentially and return a :class:`PipelineResult`."""
-        context: Dict[str, Any] = dict(initial_context or {})
+    def run(self, initial_context: Optional[Mapping[str, Any]] = None) -> PipelineResult:
+        """Execute all steps sequentially and return a :class:`PipelineResult`.
+
+        ``initial_context`` may be ``None`` or any mapping. Each successful
+        step must return a mapping; otherwise the step is recorded as failed.
+        """
+        context = _coerce_context(initial_context, "initial_context")
         step_results: List[PipelineStepResult] = []
         pipeline_start = time.monotonic()
         aborted = False
@@ -192,10 +220,13 @@ class Pipeline:
             start = time.monotonic()
             try:
                 output = step.handler(context)
+                if not isinstance(output, Mapping):
+                    raise TypeError(
+                        f"Pipeline step {step.name!r} must return a mapping, "
+                        f"got {type(output).__name__}"
+                    )
                 elapsed = time.monotonic() - start
-                # The handler should return the updated context dict.
-                if isinstance(output, dict):
-                    context = output
+                context = dict(output)
                 step_results.append(
                     PipelineStepResult(
                         step_name=step.name,
@@ -268,6 +299,8 @@ class Router:
     """
 
     def __init__(self, default_handler: Optional[Callable[[Any], Any]] = None) -> None:
+        if default_handler is not None and not callable(default_handler):
+            raise TypeError("default_handler must be callable or None")
         self._handlers: Dict[str, Callable[[Any], Any]] = {}
         self._default_handler = default_handler
         self._lock = threading.RLock()
@@ -275,20 +308,20 @@ class Router:
 
     def register(self, routing_key: str, handler: Callable[[Any], Any]) -> "Router":
         """Register a handler for *routing_key*.  Returns *self* for chaining."""
-        if not routing_key.strip():
-            raise ValueError("routing_key cannot be empty")
+        normalized_key = _normalize_name(routing_key, "routing_key")
         if not callable(handler):
             raise TypeError("handler must be callable")
         with self._lock:
-            self._handlers[routing_key.strip()] = handler
-            self._dispatch_counts.setdefault(routing_key.strip(), 0)
+            self._handlers[normalized_key] = handler
+            self._dispatch_counts.setdefault(normalized_key, 0)
         return self
 
     def unregister(self, routing_key: str) -> bool:
         """Remove the handler for *routing_key*."""
+        normalized_key = _normalize_name(routing_key, "routing_key")
         with self._lock:
-            if routing_key in self._handlers:
-                del self._handlers[routing_key]
+            if normalized_key in self._handlers:
+                del self._handlers[normalized_key]
                 return True
             return False
 
@@ -298,14 +331,15 @@ class Router:
         Falls back to the *default_handler* when no specific handler is found.
         Returns a :class:`RouterResult` whether or not dispatch succeeded.
         """
+        normalized_key = _normalize_name(routing_key, "routing_key")
         with self._lock:
-            handler = self._handlers.get(routing_key) or self._default_handler
+            handler = self._handlers.get(normalized_key) or self._default_handler
 
         if handler is None:
             return RouterResult(
-                routing_key=routing_key,
+                routing_key=normalized_key,
                 success=False,
-                error=f"No handler registered for routing key {routing_key!r}",
+                error=f"No handler registered for routing key {normalized_key!r}",
             )
 
         start = time.monotonic()
@@ -313,9 +347,9 @@ class Router:
             output = handler(payload)
             elapsed = time.monotonic() - start
             with self._lock:
-                self._dispatch_counts[routing_key] = self._dispatch_counts.get(routing_key, 0) + 1
+                self._dispatch_counts[normalized_key] = self._dispatch_counts.get(normalized_key, 0) + 1
             return RouterResult(
-                routing_key=routing_key,
+                routing_key=normalized_key,
                 success=True,
                 output=output,
                 duration_seconds=elapsed,
@@ -323,7 +357,7 @@ class Router:
         except Exception as exc:
             elapsed = time.monotonic() - start
             return RouterResult(
-                routing_key=routing_key,
+                routing_key=normalized_key,
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
                 duration_seconds=elapsed,
@@ -380,9 +414,7 @@ class Coordinator:
     """
 
     def __init__(self, name: str) -> None:
-        if not name.strip():
-            raise ValueError("Coordinator name cannot be empty")
-        self.name = name.strip()
+        self.name = _normalize_name(name, "Coordinator name")
         self._components: Dict[str, Callable[[Dict[str, Any]], Any]] = {}
         self._lock = threading.RLock()
 
@@ -392,19 +424,19 @@ class Coordinator:
         component: Callable[[Dict[str, Any]], Any],
     ) -> "Coordinator":
         """Register a component.  Returns *self* for chaining."""
-        if not name.strip():
-            raise ValueError("Component name cannot be empty")
+        normalized_name = _normalize_name(name, "Component name")
         if not callable(component):
             raise TypeError("component must be callable")
         with self._lock:
-            self._components[name.strip()] = component
+            self._components[normalized_name] = component
         return self
 
     def remove_component(self, name: str) -> bool:
         """Remove a component by name."""
+        normalized_name = _normalize_name(name, "component name")
         with self._lock:
-            if name in self._components:
-                del self._components[name]
+            if normalized_name in self._components:
+                del self._components[normalized_name]
                 return True
             return False
 
@@ -413,13 +445,15 @@ class Coordinator:
         with self._lock:
             return list(self._components.keys())
 
-    def run_all(self, context: Optional[Dict[str, Any]] = None) -> CoordinatorResult:
+    def run_all(self, context: Optional[Mapping[str, Any]] = None) -> CoordinatorResult:
         """Call every component with *context* and aggregate results.
 
         Failures in individual components are recorded in
         :attr:`CoordinatorResult.errors` and do not abort other components.
+        Each component receives its own shallow copy of the input context so
+        one component cannot accidentally mutate another component's view.
         """
-        ctx = dict(context or {})
+        ctx = _coerce_context(context, "context")
         results: Dict[str, Any] = {}
         errors: Dict[str, str] = {}
         start = time.monotonic()
@@ -429,7 +463,7 @@ class Coordinator:
 
         for comp_name, comp_fn in components:
             try:
-                results[comp_name] = comp_fn(ctx)
+                results[comp_name] = comp_fn(dict(ctx))
             except Exception as exc:
                 errors[comp_name] = f"{type(exc).__name__}: {exc}"
 
@@ -442,13 +476,13 @@ class Coordinator:
             duration_seconds=elapsed,
         )
 
-    def run_sequential(self, context: Optional[Dict[str, Any]] = None) -> CoordinatorResult:
+    def run_sequential(self, context: Optional[Mapping[str, Any]] = None) -> CoordinatorResult:
         """Call components sequentially, passing each component's output as the
         context for the next component (dict outputs are merged; non-dict
         outputs are stored under the component name and the original context
-        continues).
+        continues). ``context`` may be ``None`` or any mapping.
         """
-        ctx = dict(context or {})
+        ctx = _coerce_context(context, "context")
         results: Dict[str, Any] = {}
         errors: Dict[str, str] = {}
         start = time.monotonic()
