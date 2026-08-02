@@ -6,25 +6,46 @@
 Features:
 - Preserves the original output: "ai deepthinking"
 - Adds multi-step reflective reasoning
+- Explains where each answer comes from
 - Supports configurable thinking depth
 - Accepts an optional topic from command line
+- Supports an optional knowledge file for more grounded answers
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import random
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import List
+
+
+@dataclass
+class ThoughtStep:
+    step: int
+    question: str
+    answer: str
+    source: str
+    note: str
 
 
 class DeepThinker:
     """Simulates layered AI-style thinking for a given topic."""
 
-    def __init__(self, topic: str, depth: int = 5, seed: int | None = None) -> None:
+    def __init__(
+        self,
+        topic: str,
+        depth: int = 5,
+        seed: int | None = None,
+        knowledge: list[str] | None = None,
+    ) -> None:
         self.topic = topic.strip() if topic else "general intelligence"
         self.depth = max(1, depth)
         self._rng = random.Random(seed)
+        self.knowledge = [item.strip() for item in (knowledge or []) if item.strip()]
 
     def _question_templates(self) -> List[str]:
         return [
@@ -48,26 +69,71 @@ class DeepThinker:
             "Insight: progress is faster with small testable steps.",
         ]
 
-    def think(self) -> List[str]:
+    def _knowledge_answer(self) -> str | None:
+        if not self.knowledge:
+            return None
+        return self._rng.choice(self.knowledge)
+
+    def _source_description(self) -> str:
+        if self.knowledge:
+            return "user-provided knowledge file"
+        return "hardcoded question and insight templates"
+
+    def think(self) -> List[ThoughtStep]:
         """Generate layered thinking steps and concise insights."""
-        thoughts: List[str] = []
+        thoughts: List[ThoughtStep] = []
         q_templates = self._question_templates()
         i_templates = self._insight_templates()
 
         for step in range(1, self.depth + 1):
             question = self._rng.choice(q_templates).format(topic=self.topic)
-            insight = self._rng.choice(i_templates)
-            thoughts.append(f"Step {step}: {question}")
-            thoughts.append(f"         {insight}")
+            template_insight = self._rng.choice(i_templates)
+            knowledge_answer = self._knowledge_answer()
+            answer = knowledge_answer or template_insight.replace("Insight: ", "")
+            note = (
+                "Selected from the provided knowledge file."
+                if knowledge_answer
+                else "Selected from the built-in insight templates because no knowledge file was supplied."
+            )
+            thoughts.append(
+                ThoughtStep(
+                    step=step,
+                    question=question,
+                    answer=answer,
+                    source=self._source_description(),
+                    note=note,
+                )
+            )
 
         return thoughts
 
-    def summarize(self, thoughts: List[str]) -> str:
+    def summarize(self, thoughts: List[ThoughtStep]) -> str:
         """Create a compact summary after thinking."""
+        source = "knowledge file" if self.knowledge else "built-in templates"
         return (
             f"Summary: After {self.depth} deep-thinking steps on '{self.topic}', "
-            "the best path is to define clear goals, test assumptions, and iterate quickly."
+            f"the answers came from {source}. The best path is to define clear goals, "
+            "test assumptions, and iterate quickly."
         )
+
+
+def load_knowledge_file(path: str | None) -> list[str]:
+    if not path:
+        return []
+
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Knowledge file not found: {path}")
+
+    if file_path.suffix.lower() == ".json":
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(item) for item in data]
+        if isinstance(data, dict) and "knowledge" in data and isinstance(data["knowledge"], list):
+            return [str(item) for item in data["knowledge"]]
+        raise ValueError("JSON knowledge file must contain a list or a {\"knowledge\": [...]} object")
+
+    return [line.strip() for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,27 +156,37 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional random seed for reproducible output",
     )
+    parser.add_argument(
+        "--knowledge-file",
+        default=None,
+        help="Optional .txt or .json file containing grounded knowledge lines",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    knowledge = load_knowledge_file(args.knowledge_file)
 
     # Preserve original text
     print("ai deepthinking")
     print("-" * 40)
 
-    thinker = DeepThinker(topic=args.topic, depth=args.depth, seed=args.seed)
+    thinker = DeepThinker(topic=args.topic, depth=args.depth, seed=args.seed, knowledge=knowledge)
     timestamp = datetime.now().isoformat(timespec="seconds")
 
     print(f"Started at: {timestamp}")
     print(f"Topic: {thinker.topic}")
     print(f"Depth: {thinker.depth}")
+    print(f"Answer source: {'knowledge file' if knowledge else 'built-in templates'}")
     print("-" * 40)
 
     thoughts = thinker.think()
-    for line in thoughts:
-        print(line)
+    for item in thoughts:
+        print(f"Step {item.step}: {item.question}")
+        print(f"         Answer: {item.answer}")
+        print(f"         Source: {item.source}")
+        print(f"         Note: {item.note}")
 
     print("-" * 40)
     print(thinker.summarize(thoughts))
