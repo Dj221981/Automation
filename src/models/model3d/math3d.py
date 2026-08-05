@@ -349,7 +349,7 @@ class Quaternion:
         theta = theta_0 * t
         sin_theta = math.sin(theta)
         sin_theta_0 = math.sin(theta_0)
-        s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
+        s0 = math.sin((1.0 - t) * theta_0) / sin_theta_0
         s1 = sin_theta / sin_theta_0
         return Quaternion(
             s0 * self.w + s1 * other.w,

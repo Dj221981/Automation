@@ -9,8 +9,6 @@ from pathlib import Path
 from typing import List, Tuple
 
 from .mesh import Mesh
-from .material import Material
-from .model3d import Model3D
 from .math3d import Vector3
 
 
